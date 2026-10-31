@@ -120,3 +120,46 @@
 - `edge2`: **PASS** (`b5adb964dccd14430bd011657f2cd31b1f3dba1dc66785aed06282449aa757c1`)
 - `edge3`: **PASS** (`9d0a3e299cfa206653ea5c22373679c0e4241be11d2a463ac623ba628ec35451`)
 - `full-seed1`: **PASS** (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`)
+
+---
+
+## Optimization 4: Streaming File Input with Reusable Thread Buffers (v5)
+
+### Changes
+1. **Zero Whole-File In-Memory Loading**:
+   - Replaced `std::fs::read(&records_path)` with per-thread streaming directly from disk via `File::seek` and `Read::take`.
+   - Main thread reads only the first 4096 bytes to skip optional UTF-8 BOM and locate the CSV header newline (`body_start`), obtaining file length via metadata.
+2. **Phase 1 (Parallel Quote Counting)**:
+   - Worker threads open independent `File` handles, seek to nominal cuts $p_i$, wrap in `take(p_{i+1} - p_i)`, and count quote bytes using a reusable 1 MiB buffer.
+   - Main thread computes prefix-XOR quote parities in serial.
+3. **Phase 2 (Serial Record Boundary Alignment)**:
+   - Main thread scans forward from each $p_i$ in 4096-byte blocks tracking quote parity; the first newline encountered with parity 0 marks the chunk start.
+4. **Phase 3 (Parallel Streaming Parsing with `RecordParser`)**:
+   - Refactored parsing state into `RecordParser` struct with reusable `scratch_name` and thread-local dictionary.
+   - Each thread streams its assigned byte range in a reusable 1 MiB buffer (`BUF_SIZE = 1048576`).
+   - Scans backwards from filled buffer length to identify the latest record boundary (`\n` at even quote parity), parses complete records via `parse_block`, and shifts incomplete trailing bytes with `copy_within`.
+   - Parses any remaining unclosed record at EOF after streaming loop.
+5. **Phase 4 (Merge) & Output**:
+   - Kept verbatim.
+
+### Benchmark Results on Full Dataset (3.32M rows, 201.9 MB)
+- **CPU**: 13th Gen Intel(R) Core(TM) i5-13420H (12 logical processors, `available_parallelism` = 12)
+- **Run 1**: 0.7843 s (Peak Working Set: 196.27 MB)
+- **Run 2**: 0.7058 s (Peak Working Set: 195.10 MB)
+- **Run 3**: 0.6888 s (Peak Working Set: 197.04 MB)
+- **Run 4**: 0.8060 s (Peak Working Set: 197.31 MB)
+- **Run 5**: 0.7168 s (Peak Working Set: 195.71 MB)
+- **Min Wall Time**: **0.6888 s** (688.81 ms) — **7.75x faster** vs v1 baseline (5.3360 s)
+- **Median Wall Time**: **0.7168 s** (716.85 ms) — **7.70x faster** vs v1 baseline (5.5230 s)
+- **Peak Working Set**: **196.27 MB** median (**197.31 MB** max) — **reduced by 183.02 MB (48.2%)** vs v4 (379.29 MB)
+
+### Verification
+- Matrix testing across 7 thread counts ($n \in \{1, 2, 3, 5, 7, 12, 16\}$) and 5 buffer sizes ($buf \in \{64, 100, 333, 4096, 1048576\}$) across 5 datasets (tiny, edge1, edge2, edge3, sample): **175 / 175 PASS**
+- Full dataset verification across 4 configurations ($n \in \{\text{default}, 12\}$, $buf \in \{65536, 1048576\}$): **4 / 4 PASS**
+- Total matrix tests: **179 / 179 PASS**
+- `tiny-seed1`: **PASS** (`e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733`)
+- `sample-seed1`: **PASS** (`9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`)
+- `edge1`: **PASS** (`6966d443af80c6e0816b1cc45a5b3c3f687d3040d96f656f817d0e6f7f28df16`)
+- `edge2`: **PASS** (`b5adb964dccd14430bd011657f2cd31b1f3dba1dc66785aed06282449aa757c1`)
+- `edge3`: **PASS** (`9d0a3e299cfa206653ea5c22373679c0e4241be11d2a463ac623ba628ec35451`)
+- `full-seed1`: **PASS** (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`)

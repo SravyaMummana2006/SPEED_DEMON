@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
 const UNMATCHED: &str = "_UNMATCHED";
 const MAX_REGION: usize = 1_000_000;
+const BUF_SIZE: usize = 1024 * 1024;
 
 #[derive(Default)]
 struct MyHasher(u64);
@@ -146,182 +147,264 @@ fn load_regions(path: &Path) -> Result<RegionTable, Box<dyn std::error::Error>> 
     })
 }
 
-fn parse_chunk(data: &[u8], regions: &RegionTable) -> (Vec<CountryStats>, Vec<Vec<u8>>) {
-    let mut pos = 0;
-    let len = data.len();
+struct RecordParser<'a> {
+    country_stats: Vec<CountryStats>,
+    local_names: Vec<Vec<u8>>,
+    names_dict: NameDictionary,
+    scratch_name: Vec<u8>,
+    regions: &'a RegionTable,
+}
 
-    let mut country_stats: Vec<CountryStats> = (0..regions.country_names.len())
-        .map(|_| CountryStats::default())
-        .collect();
+impl<'a> RecordParser<'a> {
+    fn new(regions: &'a RegionTable) -> Self {
+        let country_stats: Vec<CountryStats> = (0..regions.country_names.len())
+            .map(|_| CountryStats::default())
+            .collect();
+        let local_names: Vec<Vec<u8>> = Vec::new();
+        let names_dict: NameDictionary = HashMap::default();
+        let scratch_name: Vec<u8> = Vec::with_capacity(64);
 
-    let mut local_names: Vec<Vec<u8>> = Vec::new();
-    let mut names_dict: NameDictionary = HashMap::default();
-    let mut scratch_name: Vec<u8> = Vec::with_capacity(64);
-
-    while pos < len {
-        // Skip BOM at start of record if present
-        if data[pos..].starts_with(BOM) {
-            pos += 3;
+        Self {
+            country_stats,
+            local_names,
+            names_dict,
+            scratch_name,
+            regions,
         }
+    }
 
-        // 1. id (ASCII digits until comma)
-        let mut id: u64 = 0;
-        while pos < len && data[pos] != b',' {
-            if data[pos] >= b'0' && data[pos] <= b'9' {
-                id = id * 10 + (data[pos] - b'0') as u64;
-            }
-            pos += 1;
-        }
-        if pos < len && data[pos] == b',' {
-            pos += 1;
-        }
+    fn parse_block(&mut self, data: &[u8]) {
+        let mut pos = 0;
+        let len = data.len();
 
-        // 2. name
-        let (name_slice, name_len): (&[u8], u64) = if pos < len && data[pos] == b'"' {
-            pos += 1; // skip opening quote
-            let start = pos;
-            let mut has_quotes = false;
-            while pos < len {
-                if data[pos] == b'"' {
-                    if pos + 1 < len && data[pos + 1] == b'"' {
-                        has_quotes = true;
-                        pos += 2;
-                    } else {
-                        break; // closing quote
-                    }
-                } else {
-                    pos += 1;
-                }
+        while pos < len {
+            // Skip BOM at start of record if present
+            if data[pos..].starts_with(BOM) {
+                pos += 3;
             }
-            let raw_slice = &data[start..pos];
-            if pos < len && data[pos] == b'"' {
-                pos += 1; // skip closing quote
-            }
-            if has_quotes {
-                scratch_name.clear();
-                let mut i = 0;
-                while i < raw_slice.len() {
-                    if raw_slice[i] == b'"' && i + 1 < raw_slice.len() && raw_slice[i + 1] == b'"' {
-                        scratch_name.push(b'"');
-                        i += 2;
-                    } else {
-                        scratch_name.push(raw_slice[i]);
-                        i += 1;
-                    }
-                }
-                (&scratch_name[..], scratch_name.len() as u64)
-            } else {
-                (raw_slice, raw_slice.len() as u64)
-            }
-        } else {
-            // unquoted empty or value until comma
-            let start = pos;
+
+            // 1. id (ASCII digits until comma)
+            let mut id: u64 = 0;
             while pos < len && data[pos] != b',' {
+                if data[pos] >= b'0' && data[pos] <= b'9' {
+                    id = id * 10 + (data[pos] - b'0') as u64;
+                }
                 pos += 1;
             }
-            let raw_slice = &data[start..pos];
-            (raw_slice, raw_slice.len() as u64)
-        };
-        if pos < len && data[pos] == b',' {
-            pos += 1;
-        }
+            if pos < len && data[pos] == b',' {
+                pos += 1;
+            }
 
-        let name_id = if let Some(&nid) = names_dict.get(name_slice) {
-            nid
-        } else {
-            let nid = local_names.len() as u32;
-            let vec_name = name_slice.to_vec();
-            names_dict.insert(vec_name.clone(), nid);
-            local_names.push(vec_name);
-            nid
-        };
-
-        // 3. note
-        let mut note_len: u64 = 0;
-        if pos < len && data[pos] == b'"' {
-            pos += 1; // skip opening quote
-            while pos < len {
-                if data[pos] == b'"' {
-                    if pos + 1 < len && data[pos + 1] == b'"' {
-                        note_len += 1;
-                        pos += 2;
+            // 2. name
+            let (name_slice, name_len): (&[u8], u64) = if pos < len && data[pos] == b'"' {
+                pos += 1; // skip opening quote
+                let start = pos;
+                let mut has_quotes = false;
+                while pos < len {
+                    if data[pos] == b'"' {
+                        if pos + 1 < len && data[pos + 1] == b'"' {
+                            has_quotes = true;
+                            pos += 2;
+                        } else {
+                            break; // closing quote
+                        }
                     } else {
-                        pos += 1; // closing quote
-                        break;
+                        pos += 1;
                     }
+                }
+                let raw_slice = &data[start..pos];
+                if pos < len && data[pos] == b'"' {
+                    pos += 1; // skip closing quote
+                }
+                if has_quotes {
+                    self.scratch_name.clear();
+                    let mut i = 0;
+                    while i < raw_slice.len() {
+                        if raw_slice[i] == b'"'
+                            && i + 1 < raw_slice.len()
+                            && raw_slice[i + 1] == b'"'
+                        {
+                            self.scratch_name.push(b'"');
+                            i += 2;
+                        } else {
+                            self.scratch_name.push(raw_slice[i]);
+                            i += 1;
+                        }
+                    }
+                    (&self.scratch_name[..], self.scratch_name.len() as u64)
                 } else {
+                    (raw_slice, raw_slice.len() as u64)
+                }
+            } else {
+                // unquoted empty or value until comma
+                let start = pos;
+                while pos < len && data[pos] != b',' {
+                    pos += 1;
+                }
+                let raw_slice = &data[start..pos];
+                (raw_slice, raw_slice.len() as u64)
+            };
+            if pos < len && data[pos] == b',' {
+                pos += 1;
+            }
+
+            let name_id = if let Some(&nid) = self.names_dict.get(name_slice) {
+                nid
+            } else {
+                let nid = self.local_names.len() as u32;
+                let vec_name = name_slice.to_vec();
+                self.names_dict.insert(vec_name.clone(), nid);
+                self.local_names.push(vec_name);
+                nid
+            };
+
+            // 3. note
+            let mut note_len: u64 = 0;
+            if pos < len && data[pos] == b'"' {
+                pos += 1; // skip opening quote
+                while pos < len {
+                    if data[pos] == b'"' {
+                        if pos + 1 < len && data[pos + 1] == b'"' {
+                            note_len += 1;
+                            pos += 2;
+                        } else {
+                            pos += 1; // closing quote
+                            break;
+                        }
+                    } else {
+                        note_len += 1;
+                        pos += 1;
+                    }
+                }
+            } else {
+                // unquoted empty or value until comma
+                while pos < len && data[pos] != b',' {
                     note_len += 1;
                     pos += 1;
                 }
             }
-        } else {
-            // unquoted empty or value until comma
-            while pos < len && data[pos] != b',' {
-                note_len += 1;
+            if pos < len && data[pos] == b',' {
                 pos += 1;
             }
-        }
-        if pos < len && data[pos] == b',' {
-            pos += 1;
-        }
 
-        // 4. region_id (ASCII digits until comma)
-        let mut region_id: u32 = 0;
-        while pos < len && data[pos] != b',' {
-            if data[pos] >= b'0' && data[pos] <= b'9' {
-                region_id = region_id * 10 + (data[pos] - b'0') as u32;
+            // 4. region_id (ASCII digits until comma)
+            let mut region_id: u32 = 0;
+            while pos < len && data[pos] != b',' {
+                if data[pos] >= b'0' && data[pos] <= b'9' {
+                    region_id = region_id * 10 + (data[pos] - b'0') as u32;
+                }
+                pos += 1;
             }
-            pos += 1;
-        }
-        if pos < len && data[pos] == b',' {
-            pos += 1;
-        }
+            if pos < len && data[pos] == b',' {
+                pos += 1;
+            }
 
-        // 5. amount (fixed-point cents)
-        let negative = if pos < len && data[pos] == b'-' {
-            pos += 1;
-            true
-        } else {
-            false
-        };
-        let mut whole: i64 = 0;
-        while pos < len && data[pos] >= b'0' && data[pos] <= b'9' {
-            whole = whole * 10 + (data[pos] - b'0') as i64;
-            pos += 1;
-        }
-        if pos < len && data[pos] == b'.' {
-            pos += 1;
-        }
-        let mut frac: i64 = 0;
-        let mut frac_digits = 0;
-        while pos < len && data[pos] >= b'0' && data[pos] <= b'9' && frac_digits < 2 {
-            frac = frac * 10 + (data[pos] - b'0') as i64;
-            pos += 1;
-            frac_digits += 1;
-        }
-        let mut cents = whole * 100 + frac;
-        if negative {
-            cents = -cents;
-        }
+            // 5. amount (fixed-point cents)
+            let negative = if pos < len && data[pos] == b'-' {
+                pos += 1;
+                true
+            } else {
+                false
+            };
+            let mut whole: i64 = 0;
+            while pos < len && data[pos] >= b'0' && data[pos] <= b'9' {
+                whole = whole * 10 + (data[pos] - b'0') as i64;
+                pos += 1;
+            }
+            if pos < len && data[pos] == b'.' {
+                pos += 1;
+            }
+            let mut frac: i64 = 0;
+            let mut frac_digits = 0;
+            while pos < len && data[pos] >= b'0' && data[pos] <= b'9' && frac_digits < 2 {
+                frac = frac * 10 + (data[pos] - b'0') as i64;
+                pos += 1;
+                frac_digits += 1;
+            }
+            let mut cents = whole * 100 + frac;
+            if negative {
+                cents = -cents;
+            }
 
-        // Skip to end of record (CRLF or LF or EOF)
-        if pos < len && data[pos] == b'\r' {
-            pos += 1;
-        }
-        if pos < len && data[pos] == b'\n' {
-            pos += 1;
-        }
+            // Skip to end of record (CRLF or LF or EOF)
+            if pos < len && data[pos] == b'\r' {
+                pos += 1;
+            }
+            if pos < len && data[pos] == b'\n' {
+                pos += 1;
+            }
 
-        // Direct table lookup for country index
-        let cid = if (region_id as usize) < MAX_REGION {
-            regions.region_to_country[region_id as usize]
-        } else {
-            regions.unmatched_cid
-        };
-        country_stats[cid as usize].add(id, name_id, name_len, note_len, cents);
+            // Direct table lookup for country index
+            let cid = if (region_id as usize) < MAX_REGION {
+                self.regions.region_to_country[region_id as usize]
+            } else {
+                self.regions.unmatched_cid
+            };
+            self.country_stats[cid as usize].add(id, name_id, name_len, note_len, cents);
+        }
     }
 
-    (country_stats, local_names)
+    fn finish(self) -> (Vec<CountryStats>, Vec<Vec<u8>>) {
+        (self.country_stats, self.local_names)
+    }
+}
+
+fn stream_chunk(
+    path: &Path,
+    start: u64,
+    len: u64,
+    buf_size: usize,
+    regions: &RegionTable,
+) -> Result<(Vec<CountryStats>, Vec<Vec<u8>>), std::io::Error> {
+    let mut parser = RecordParser::new(regions);
+    if len == 0 {
+        return Ok(parser.finish());
+    }
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = file.take(len);
+
+    let initial_cap = buf_size.max(64);
+    let mut buf = vec![0u8; initial_cap];
+    let mut filled = 0;
+
+    loop {
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let k = reader.read(&mut buf[filled..])?;
+        if k == 0 {
+            break;
+        }
+        filled += k;
+
+        // Find the cut
+        let q = buf[..filled].iter().filter(|&&b| b == b'"').count();
+        let mut par = (q & 1) as u8;
+        let mut cut = None;
+        for idx in (0..filled).rev() {
+            let b = buf[idx];
+            let par_before = if b == b'"' { par ^ 1 } else { par };
+            if b == b'\n' && par_before == 0 {
+                cut = Some(idx + 1);
+                break;
+            }
+            par = par_before;
+        }
+
+        if let Some(cut) = cut {
+            parser.parse_block(&buf[..cut]);
+            buf.copy_within(cut..filled, 0);
+            filled -= cut;
+        }
+    }
+
+    if filled > 0 {
+        parser.parse_block(&buf[..filled]);
+    }
+
+    Ok(parser.finish())
 }
 
 fn parse_args() -> (PathBuf, PathBuf) {
@@ -361,47 +444,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let records_path = data_dir.join("records.csv");
 
     let regions = load_regions(&regions_path)?;
-    let records_data = std::fs::read(&records_path)?;
+    let len = std::fs::metadata(&records_path)?.len();
 
-    // Skip BOM at start of file if present
-    let mut pos = 0;
-    if records_data.starts_with(BOM) {
-        pos += 3;
-    }
+    let body_start = if len == 0 {
+        0
+    } else {
+        let mut file = File::open(&records_path)?;
+        let mut header_buf = [0u8; 4096];
+        let to_read = (len as usize).min(header_buf.len());
+        file.read_exact(&mut header_buf[..to_read])?;
+        let header_slice = &header_buf[..to_read];
 
-    // Skip header line ONCE
-    while pos < records_data.len() && records_data[pos] != b'\n' {
-        pos += 1;
-    }
-    if pos < records_data.len() && records_data[pos] == b'\n' {
-        pos += 1;
-    }
+        let mut pos = 0;
+        if header_slice.starts_with(BOM) {
+            pos += 3;
+        }
+        match header_slice[pos..].iter().position(|&b| b == b'\n') {
+            Some(idx) => (pos + idx + 1) as u64,
+            None => len,
+        }
+    };
 
-    let body = &records_data[pos..];
+    let body_len = len.saturating_sub(body_start);
 
-    // Thread count n: available_parallelism, fallback 1. If body < 1 MB, n = 1.
-    let p = std::thread::available_parallelism()
-        .map(|n| n.get())
+    let p_avail = std::thread::available_parallelism()
+        .map(|m| m.get())
         .unwrap_or(1);
-    let n = if body.len() < 1_000_000 { 1 } else { p };
+    let n = if body_len < 1_000_000 { 1 } else { p_avail };
 
-    // Nominal cut points p_i = i * body.len() / n for i in 0..=n
     let mut p = Vec::with_capacity(n + 1);
     for i in 0..=n {
-        p.push(i * body.len() / n);
+        p.push(body_start + (i as u64) * body_len / (n as u64));
     }
 
     // PHASE 1 (parallel): count b'"' in each segment [p_i, p_{i+1})
     let quote_counts: Vec<usize> = if n <= 1 {
-        vec![body.iter().filter(|&&b| b == b'"').count()]
+        vec![0]
     } else {
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n);
             for i in 0..n {
-                let seg = &body[p[i]..p[i + 1]];
-                handles.push(s.spawn(move || seg.iter().filter(|&&b| b == b'"').count()));
+                let start = p[i];
+                let count_len = p[i + 1] - p[i];
+                let path = &records_path;
+                handles.push(s.spawn(move || -> Result<usize, std::io::Error> {
+                    let mut file = File::open(path)?;
+                    file.seek(SeekFrom::Start(start))?;
+                    let mut reader = file.take(count_len);
+                    let mut buf = vec![0u8; BUF_SIZE];
+                    let mut total_quotes = 0;
+                    loop {
+                        let k = reader.read(&mut buf)?;
+                        if k == 0 {
+                            break;
+                        }
+                        total_quotes += buf[..k].iter().filter(|&&b| b == b'"').count();
+                    }
+                    Ok(total_quotes)
+                }));
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect()
         })
     };
 
@@ -411,57 +516,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parity_at[i + 1] = parity_at[i] ^ ((quote_counts[i] & 1) as u8);
     }
 
-    // PHASE 2 (parallel): find record boundaries for chunk starts
-    let mut starts = vec![0; n + 1];
-    starts[0] = 0;
-    starts[n] = body.len();
+    // PHASE 2 (main thread, serial): find record boundaries for chunk starts
+    let mut starts = vec![0u64; n + 1];
+    starts[0] = body_start;
+    starts[n] = len;
 
     if n > 1 {
-        let found_starts: Vec<usize> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n - 1);
-            for i in 1..n {
-                let p_i = p[i];
-                let parity_init = parity_at[i];
-                handles.push(s.spawn(move || {
-                    let mut parity = parity_init;
-                    let mut start = body.len();
-                    for k in p_i..body.len() {
-                        let b = body[k];
-                        if b == b'"' {
-                            parity ^= 1;
-                        } else if b == b'\n' && parity == 0 {
-                            start = k + 1;
-                            break;
-                        }
-                    }
-                    start
-                }));
+        let mut file = File::open(&records_path)?;
+        for i in 1..n {
+            let p_i = p[i];
+            if p_i >= len {
+                starts[i] = len;
+                continue;
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        for (i, s) in found_starts.into_iter().enumerate() {
-            starts[i + 1] = s;
+            let mut parity = parity_at[i];
+            file.seek(SeekFrom::Start(p_i))?;
+            let mut scan_buf = [0u8; 4096];
+            let mut found = false;
+            let mut abs_pos = p_i;
+            loop {
+                let k = file.read(&mut scan_buf)?;
+                if k == 0 {
+                    break;
+                }
+                for j in 0..k {
+                    let b = scan_buf[j];
+                    if b == b'"' {
+                        parity ^= 1;
+                    } else if b == b'\n' && parity == 0 {
+                        starts[i] = abs_pos + (j as u64) + 1;
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    break;
+                }
+                abs_pos += k as u64;
+            }
+            if !found {
+                starts[i] = len;
+            }
         }
     }
 
     // Clamp starts non-decreasing
     for i in 1..=n {
-        starts[i] = starts[i].max(starts[i - 1]).min(body.len());
+        starts[i] = starts[i].max(starts[i - 1]).min(len);
     }
 
     // PHASE 3 (parallel parsing): parse chunks
     let thread_results: Vec<(Vec<CountryStats>, Vec<Vec<u8>>)> = if n <= 1 {
-        vec![parse_chunk(body, &regions)]
+        vec![stream_chunk(
+            &records_path,
+            starts[0],
+            starts[1] - starts[0],
+            BUF_SIZE,
+            &regions,
+        )?]
     } else {
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n);
             for i in 0..n {
-                let chunk = &body[starts[i]..starts[i + 1]];
+                let start = starts[i];
+                let chunk_len = starts[i + 1] - starts[i];
+                let path = &records_path;
                 let r = &regions;
-                handles.push(s.spawn(move || parse_chunk(chunk, r)));
+                handles.push(s.spawn(move || stream_chunk(path, start, chunk_len, BUF_SIZE, r)));
             }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap().unwrap())
+                .collect()
         })
     };
 
