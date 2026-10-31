@@ -79,3 +79,22 @@
   - **Min Wall Time**: 0.1333 s (133.28 ms) — vs v3 0.2949 s (−54.8%)
   - **Median Wall Time**: 0.1629 s (162.90 ms) — vs v3 0.3235 s (−49.6%)
   - **Peak Working Set**: 50.07 MB median (51.36 MB max) — well within 1 GB limit
+
+## SWAR Parser, Lock-Free Global Dictionary & Ordered Parallel Reduction (v6 / Part 3)
+- **Architecture**: Complete architectural rewrite with standard library only, zero external crates, no `unsafe`.
+  1. **Line-aligned chunk streaming**: Main thread finds newline boundaries without loading the file into memory. Each thread opens its own `File`, seeks to its chunk start, wraps it in `take()`, and streams data through a reusable 1 MiB buffer (+16 bytes zero padding).
+  2. **SWAR parsing**: 8-byte SWAR space detection for endpoints, folded into a 64-bit rolling hash. Direct $O(1)$ hour computation ($0..95$) from fixed timestamp offsets. Lock-free insertion/lookup into a single shared 4096-slot `AtomicU64` open-addressing table with `compare_exchange(0, h, Relaxed, Relaxed)`. Newly discovered endpoint bytes saved once to a shared `Mutex<Vec<(usize, Vec<u8>)>>`. Per-record latencies and tags `(slot << 1 | err)` appended directly to thread-local 96 hour buckets with zero heap churn.
+  3. **Lexicographical endpoint ranking**: Main thread sorts distinct endpoints by byte order and builds an $O(1)$ `rank[slot]` table.
+  4. **Parallel finish phase with ordered streaming write**: Worker threads claim hours dynamically via `AtomicUsize`. For each hour: claims and takes thread-local buckets across all threads via `std::mem::take`, packs 64-bit sort keys `((rank as u64) << 33) | ((lat as u64) << 1) | err`, sorts keys with `sort_unstable()`, aggregates runs, computes nearest-rank percentiles (`(P * n + 99) / 100`) and error ppm, serializes hand-written formatted bytes into a per-hour buffer, and stores it in a 96-slot shared array. A thread-safe writer drain writes contiguous ready hour buffers sequentially to `summary.txt` on the fly, bounding peak memory.
+- **Dataset**: `full-seed1` (3,100,000 records, 238,836,234 bytes)
+- **CPU**: 13th Gen Intel(R) Core(TM) i5-13420H (12 logical cores, `available_parallelism = 12`)
+- **Measured Wall Times (5 runs)**:
+  - Run 1: 0.0859 s (Peak Working Set: 33.52 MB)
+  - Run 2: 0.0831 s (Peak Working Set: 34.00 MB)
+  - Run 3: 0.0744 s (Peak Working Set: 34.66 MB)
+  - Run 4: 0.0773 s (Peak Working Set: 34.80 MB)
+  - Run 5: 0.0760 s (Peak Working Set: 34.36 MB)
+- **Summary**:
+  - **Min Wall Time**: 0.0744 s (74.35 ms) — vs v5 0.1333 s (**1.79x faster**)
+  - **Median Wall Time**: 0.0773 s (77.30 ms) — vs v5 0.1629 s (**2.11x faster**)
+  - **Peak Working Set**: 34.36 MB median (34.80 MB max) — vs v5 50.07 MB (**31.4% memory reduction**)
