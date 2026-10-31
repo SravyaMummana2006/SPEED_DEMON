@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 #[derive(Default)]
 struct MyHasher(u64);
@@ -60,106 +60,163 @@ fn parse_4digits(b: &[u8]) -> u32 {
         + ((b[3] - b'0') as u32)
 }
 
-fn parse_chunk(data: &[u8]) -> (Vec<Vec<u8>>, Vec<Group>) {
-    let len = data.len();
-    let mut pos = 0;
+struct ChunkParser {
+    endpoints: Vec<Vec<u8>>,
+    endpoint_dict: EndpointDictionary,
+    groups: Vec<Group>,
+    group_map: GroupMap,
+}
 
-    let mut endpoints: Vec<Vec<u8>> = Vec::new();
-    let mut endpoint_dict: EndpointDictionary = HashMap::default();
-
-    let mut groups: Vec<Group> = Vec::new();
-    let mut group_map: GroupMap = HashMap::default();
-
-    while pos < len {
-        let line_start = pos;
-        while pos < len && data[pos] != b'\n' {
-            pos += 1;
+impl ChunkParser {
+    fn new() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            endpoint_dict: HashMap::default(),
+            groups: Vec::new(),
+            group_map: HashMap::default(),
         }
-        let line = &data[line_start..pos];
-        if pos < len && data[pos] == b'\n' {
-            pos += 1;
-        }
-        if line.is_empty() {
-            continue;
-        }
-
-        // 1. ts (27 bytes: YYYY-MM-DDTHH:MM:SS.ffffffZ)
-        let year = parse_4digits(&line[0..4]);
-        let month = parse_2digits(&line[5..7]);
-        let day = parse_2digits(&line[8..10]);
-        let hour = parse_2digits(&line[11..13]);
-        let hour_key = year * 1_000_000 + month * 10_000 + day * 100 + hour;
-
-        // 2. method (after 1st space at index 27, ends at 2nd space)
-        let mut p2 = 28;
-        while p2 < line.len() && line[p2] != b' ' {
-            p2 += 1;
-        }
-
-        // 3. endpoint (between 2nd space and 3rd space)
-        let endpoint_start = p2 + 1;
-        let mut p3 = endpoint_start;
-        while p3 < line.len() && line[p3] != b' ' {
-            p3 += 1;
-        }
-        let endpoint_bytes = &line[endpoint_start..p3];
-
-        let endpoint_id = if let Some(&id) = endpoint_dict.get(endpoint_bytes) {
-            id
-        } else {
-            let id = endpoints.len() as u32;
-            let vec_endpoint = endpoint_bytes.to_vec();
-            endpoint_dict.insert(vec_endpoint.clone(), id);
-            endpoints.push(vec_endpoint);
-            id
-        };
-
-        // 4. status (between 3rd space and 4th space)
-        let status_start = p3 + 1;
-        let mut p4 = status_start;
-        while p4 < line.len() && line[p4] != b' ' {
-            p4 += 1;
-        }
-        let status_bytes = &line[status_start..p4];
-        let status = ((status_bytes[0] - b'0') as u32) * 100
-            + ((status_bytes[1] - b'0') as u32) * 10
-            + ((status_bytes[2] - b'0') as u32);
-
-        // 5. latency (from 4th space + 1 to line end)
-        let latency_bytes = &line[p4 + 1..];
-        let mut latency: u32 = 0;
-        for &b in latency_bytes {
-            if b >= b'0' && b <= b'9' {
-                latency = latency * 10 + (b - b'0') as u32;
-            }
-        }
-
-        // Group lookup
-        let group_key = ((hour_key as u64) << 32) | (endpoint_id as u64);
-        let group_idx = if let Some(&idx) = group_map.get(&group_key) {
-            idx
-        } else {
-            let idx = groups.len();
-            group_map.insert(group_key, idx);
-            groups.push(Group {
-                hour: hour_key,
-                endpoint_id,
-                count: 0,
-                errors: 0,
-                latencies: Vec::new(),
-            });
-            idx
-        };
-
-        let g = &mut groups[group_idx];
-        g.count += 1;
-        if (500..=599).contains(&status) {
-            g.errors += 1;
-        }
-        g.latencies.push(latency);
     }
 
-    (endpoints, groups)
+    fn parse_block(&mut self, data: &[u8]) {
+        let len = data.len();
+        let mut pos = 0;
+
+        while pos < len {
+            let line_start = pos;
+            while pos < len && data[pos] != b'\n' {
+                pos += 1;
+            }
+            let line = &data[line_start..pos];
+            if pos < len && data[pos] == b'\n' {
+                pos += 1;
+            }
+            if line.is_empty() {
+                continue;
+            }
+
+            // 1. ts (27 bytes: YYYY-MM-DDTHH:MM:SS.ffffffZ)
+            let year = parse_4digits(&line[0..4]);
+            let month = parse_2digits(&line[5..7]);
+            let day = parse_2digits(&line[8..10]);
+            let hour = parse_2digits(&line[11..13]);
+            let hour_key = year * 1_000_000 + month * 10_000 + day * 100 + hour;
+
+            // 2. method (after 1st space at index 27, ends at 2nd space)
+            let mut p2 = 28;
+            while p2 < line.len() && line[p2] != b' ' {
+                p2 += 1;
+            }
+
+            // 3. endpoint (between 2nd space and 3rd space)
+            let endpoint_start = p2 + 1;
+            let mut p3 = endpoint_start;
+            while p3 < line.len() && line[p3] != b' ' {
+                p3 += 1;
+            }
+            let endpoint_bytes = &line[endpoint_start..p3];
+
+            let endpoint_id = if let Some(&id) = self.endpoint_dict.get(endpoint_bytes) {
+                id
+            } else {
+                let id = self.endpoints.len() as u32;
+                let vec_endpoint = endpoint_bytes.to_vec();
+                self.endpoint_dict.insert(vec_endpoint.clone(), id);
+                self.endpoints.push(vec_endpoint);
+                id
+            };
+
+            // 4. status (between 3rd space and 4th space)
+            let status_start = p3 + 1;
+            let mut p4 = status_start;
+            while p4 < line.len() && line[p4] != b' ' {
+                p4 += 1;
+            }
+            let status_bytes = &line[status_start..p4];
+            let status = ((status_bytes[0] - b'0') as u32) * 100
+                + ((status_bytes[1] - b'0') as u32) * 10
+                + ((status_bytes[2] - b'0') as u32);
+
+            // 5. latency (from 4th space + 1 to line end)
+            let latency_bytes = &line[p4 + 1..];
+            let mut latency: u32 = 0;
+            for &b in latency_bytes {
+                if b >= b'0' && b <= b'9' {
+                    latency = latency * 10 + (b - b'0') as u32;
+                }
+            }
+
+            // Group lookup
+            let group_key = ((hour_key as u64) << 32) | (endpoint_id as u64);
+            let group_idx = if let Some(&idx) = self.group_map.get(&group_key) {
+                idx
+            } else {
+                let idx = self.groups.len();
+                self.group_map.insert(group_key, idx);
+                self.groups.push(Group {
+                    hour: hour_key,
+                    endpoint_id,
+                    count: 0,
+                    errors: 0,
+                    latencies: Vec::new(),
+                });
+                idx
+            };
+
+            let g = &mut self.groups[group_idx];
+            g.count += 1;
+            if (500..=599).contains(&status) {
+                g.errors += 1;
+            }
+            g.latencies.push(latency);
+        }
+    }
+
+    fn finish(self) -> (Vec<Vec<u8>>, Vec<Group>) {
+        (self.endpoints, self.groups)
+    }
+}
+
+fn stream_chunk(
+    path: &Path,
+    start: u64,
+    chunk_len: u64,
+    buf_size: usize,
+) -> (Vec<Vec<u8>>, Vec<Group>) {
+    if chunk_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut file = File::open(path).expect("failed to open input file");
+    file.seek(SeekFrom::Start(start)).expect("failed to seek");
+    let mut reader = file.take(chunk_len);
+
+    let mut parser = ChunkParser::new();
+    let mut buf = vec![0u8; buf_size.max(1)];
+    let mut filled = 0;
+
+    loop {
+        if filled == buf.len() {
+            buf.resize(buf.len() * 2, 0);
+        }
+        let bytes_read = reader.read(&mut buf[filled..]).expect("failed to read");
+        if bytes_read == 0 {
+            break;
+        }
+        filled += bytes_read;
+
+        if let Some(last_nl) = buf[..filled].iter().rposition(|&b| b == b'\n') {
+            parser.parse_block(&buf[..=last_nl]);
+            let tail_len = filled - (last_nl + 1);
+            buf.copy_within(last_nl + 1..filled, 0);
+            filled = tail_len;
+        }
+    }
+
+    if filled > 0 {
+        parser.parse_block(&buf[..filled]);
+    }
+
+    parser.finish()
 }
 
 fn parse_args() -> (PathBuf, PathBuf) {
@@ -196,45 +253,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (data_dir, out_dir) = parse_args();
     let input_path = data_dir.join("requests.log");
 
-    let data = std::fs::read(&input_path)?;
-    let len = data.len();
+    let len = std::fs::metadata(&input_path)?.len();
+    if len == 0 {
+        std::fs::create_dir_all(&out_dir)?;
+        let out_file_path = out_dir.join("summary.txt");
+        File::create(&out_file_path)?;
+        return Ok(());
+    }
 
-    // Thread count n: available_parallelism, fallback 1. If file < 1 MB, n = 1.
+    let buf_size = 1024 * 1024;
+
     let p = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let n = if len < 1_000_000 { 1 } else { p };
 
-    // Nominal cuts and line boundary alignment
-    let mut starts = vec![0; n + 1];
+    let mut starts = vec![0u64; n + 1];
     starts[0] = 0;
     starts[n] = len;
 
-    for i in 1..n {
-        let p_i = i * len / n;
-        let mut idx = len;
-        for pos in p_i..len {
-            if data[pos] == b'\n' {
-                idx = pos + 1;
-                break;
+    if n > 1 {
+        let mut boundary_file = File::open(&input_path)?;
+        let mut block = [0u8; 4096];
+        for i in 1..n {
+            let p_i = (i as u64) * len / (n as u64);
+            boundary_file.seek(SeekFrom::Start(p_i))?;
+            let mut cur_pos = p_i;
+            let mut found_boundary = None;
+            while cur_pos < len {
+                let bytes_to_read = std::cmp::min(block.len() as u64, len - cur_pos) as usize;
+                let bytes_read = boundary_file.read(&mut block[..bytes_to_read])?;
+                if bytes_read == 0 {
+                    break;
+                }
+                if let Some(pos) = block[..bytes_read].iter().position(|&b| b == b'\n') {
+                    found_boundary = Some(cur_pos + pos as u64 + 1);
+                    break;
+                }
+                cur_pos += bytes_read as u64;
             }
+            starts[i] = found_boundary.unwrap_or(len);
         }
-        starts[i] = idx;
     }
 
     for i in 1..=n {
         starts[i] = starts[i].max(starts[i - 1]).min(len);
     }
 
-    // Parallel parsing with std::thread::scope
     let thread_results: Vec<(Vec<Vec<u8>>, Vec<Group>)> = if n <= 1 {
-        vec![parse_chunk(data.as_slice())]
+        vec![stream_chunk(
+            &input_path,
+            starts[0],
+            starts[1] - starts[0],
+            buf_size,
+        )]
     } else {
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(n);
             for i in 0..n {
-                let chunk = &data[starts[i]..starts[i + 1]];
-                handles.push(s.spawn(move || parse_chunk(chunk)));
+                let start_i = starts[i];
+                let chunk_len = starts[i + 1] - starts[i];
+                let path = &input_path;
+                handles.push(s.spawn(move || stream_chunk(path, start_i, chunk_len, buf_size)));
             }
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         })
