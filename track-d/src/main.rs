@@ -4,7 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 #[inline(always)]
 fn parse_u32(bytes: &[u8], pos: &mut usize) -> u32 {
@@ -42,13 +42,51 @@ fn parse_args() -> (PathBuf, PathBuf) {
     }
 
     if !positionals.is_empty() {
-        data_dir = PathBuf::from(positionals[0]);
+        data_dir = PathBuf::from(positionals[0].clone());
     }
     if positionals.len() >= 2 {
-        out_dir = PathBuf::from(positionals[1]);
+        out_dir = PathBuf::from(positionals[1].clone());
     }
 
     (data_dir, out_dir)
+}
+
+/// Compute number of threads: available_parallelism (capped by 1 MB rule).
+fn compute_nt(body_len: usize) -> usize {
+    let p = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+    if body_len < 1_000_000 {
+        1
+    } else {
+        p
+    }
+}
+
+/// Split `body` into `nt` line-aligned chunks.
+/// starts[0] = 0, starts[nt] = body.len().
+/// For i in 1..nt: first '\n' at or after p_i = i * len / nt,
+/// start_i = pos_of_newline + 1 (or len if none found).
+/// Starts are made non-decreasing.
+fn line_aligned_starts(body: &[u8], nt: usize) -> Vec<usize> {
+    let len = body.len();
+    let mut starts = vec![0usize; nt + 1];
+    starts[nt] = len;
+    for i in 1..nt {
+        let p = i * len / nt;
+        let mut q = p;
+        while q < len && body[q] != b'\n' {
+            q += 1;
+        }
+        starts[i] = if q < len { q + 1 } else { len };
+    }
+    // Make non-decreasing
+    for i in 1..=nt {
+        if starts[i] < starts[i - 1] {
+            starts[i] = starts[i - 1];
+        }
+    }
+    starts
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,62 +98,168 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_bytes = std::fs::read(&graph_path)?;
     let query_bytes = std::fs::read(&queries_path)?;
 
-    // Parse header
+    // Parse header: first line is "n m"
     let mut pos = 0;
     let n = parse_u32(&graph_bytes, &mut pos) as usize;
     let m = parse_u32(&graph_bytes, &mut pos) as usize;
 
+    // Advance pos to start of body (after the '\n' that ends the header line)
+    while pos < graph_bytes.len() && graph_bytes[pos] != b'\n' {
+        pos += 1;
+    }
+    if pos < graph_bytes.len() {
+        pos += 1; // skip the '\n'
+    }
     let first_edge_pos = pos;
 
-    // Pass 1: count out-degrees
-    let mut counts = vec![0u32; n];
-    let mut p1 = first_edge_pos;
-    while p1 < graph_bytes.len() {
-        while p1 < graph_bytes.len()
-            && (graph_bytes[p1] == b' ' || graph_bytes[p1] == b'\n' || graph_bytes[p1] == b'\r')
-        {
-            p1 += 1;
-        }
-        if p1 >= graph_bytes.len() {
-            break;
-        }
-        let mut u: u32 = 0;
-        while p1 < graph_bytes.len() && graph_bytes[p1] >= b'0' && graph_bytes[p1] <= b'9' {
-            u = u * 10 + (graph_bytes[p1] - b'0') as u32;
-            p1 += 1;
-        }
-        counts[u as usize] += 1;
-        while p1 < graph_bytes.len() && graph_bytes[p1] != b'\n' {
-            p1 += 1;
-        }
-        if p1 < graph_bytes.len() && graph_bytes[p1] == b'\n' {
-            p1 += 1;
-        }
-    }
+    let body = &graph_bytes[first_edge_pos..];
+    let nt = compute_nt(body.len());
+    let starts = line_aligned_starts(body, nt);
 
-    // Prefix sums for CSR offsets
-    let mut offsets = vec![0u32; n + 1];
+    // ── Pass 1 (parallel): count out-degrees and in-degrees ───────────────────
+    let counts_out: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+    let counts_in: Vec<AtomicU32> = (0..n).map(|_| AtomicU32::new(0)).collect();
+
+    std::thread::scope(|s| {
+        for ti in 0..nt {
+            let chunk = &body[starts[ti]..starts[ti + 1]];
+            let counts_out_ref = &counts_out;
+            let counts_in_ref = &counts_in;
+            s.spawn(move || {
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    // Skip whitespace / blank lines
+                    while p < chunk.len()
+                        && (chunk[p] == b' ' || chunk[p] == b'\n' || chunk[p] == b'\r')
+                    {
+                        p += 1;
+                    }
+                    if p >= chunk.len() {
+                        break;
+                    }
+                    // Parse u
+                    let mut u: u32 = 0;
+                    while p < chunk.len() && chunk[p] >= b'0' && chunk[p] <= b'9' {
+                        u = u * 10 + (chunk[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    // Skip space(s)
+                    while p < chunk.len() && (chunk[p] == b' ' || chunk[p] == b'\r') {
+                        p += 1;
+                    }
+                    // Parse v
+                    let mut v: u32 = 0;
+                    while p < chunk.len() && chunk[p] >= b'0' && chunk[p] <= b'9' {
+                        v = v * 10 + (chunk[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    counts_out_ref[u as usize].fetch_add(1, Ordering::Relaxed);
+                    counts_in_ref[v as usize].fetch_add(1, Ordering::Relaxed);
+
+                    // Skip rest of line (skip w)
+                    while p < chunk.len() && chunk[p] != b'\n' {
+                        p += 1;
+                    }
+                    if p < chunk.len() {
+                        p += 1; // skip '\n'
+                    }
+                }
+            });
+        }
+    });
+
+    // ── Prefix sums → out_offsets and in_offsets ──────────────────────────────
+    let mut out_offsets = vec![0u32; n + 1];
+    let mut in_offsets = vec![0u32; n + 1];
     for i in 0..n {
-        offsets[i + 1] = offsets[i] + counts[i];
+        out_offsets[i + 1] = out_offsets[i] + counts_out[i].load(Ordering::Relaxed);
+        in_offsets[i + 1] = in_offsets[i] + counts_in[i].load(Ordering::Relaxed);
     }
-    let mut cursor = offsets.clone();
+    drop(counts_out);
+    drop(counts_in);
 
-    // Pass 2: fill CSR edges array
-    let mut edges = vec![(0u32, 0u32); m];
-    let mut p2 = first_edge_pos;
-    for _ in 0..m {
-        let u = parse_u32(&graph_bytes, &mut p2);
-        let v = parse_u32(&graph_bytes, &mut p2);
-        let w = parse_u32(&graph_bytes, &mut p2);
-        let dest = cursor[u as usize] as usize;
-        cursor[u as usize] += 1;
-        edges[dest] = (v, w);
-    }
-    drop(cursor);
-    drop(counts);
+    let cursor_out: Vec<AtomicU32> = out_offsets[..n]
+        .iter()
+        .map(|&v| AtomicU32::new(v))
+        .collect();
+    let cursor_in: Vec<AtomicU32> = in_offsets[..n].iter().map(|&v| AtomicU32::new(v)).collect();
+
+    let fwd_edges: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
+    let rev_edges: Vec<AtomicU64> = (0..m).map(|_| AtomicU64::new(0)).collect();
+
+    // ── Pass 2 (parallel): fill forward and reverse CSR edges ─────────────────
+    std::thread::scope(|s| {
+        for ti in 0..nt {
+            let chunk = &body[starts[ti]..starts[ti + 1]];
+            let cursor_out_ref = &cursor_out;
+            let cursor_in_ref = &cursor_in;
+            let fwd_edges_ref = &fwd_edges;
+            let rev_edges_ref = &rev_edges;
+            s.spawn(move || {
+                let mut p = 0usize;
+                while p < chunk.len() {
+                    // Skip whitespace / blank lines
+                    while p < chunk.len()
+                        && (chunk[p] == b' ' || chunk[p] == b'\n' || chunk[p] == b'\r')
+                    {
+                        p += 1;
+                    }
+                    if p >= chunk.len() {
+                        break;
+                    }
+                    // Parse u
+                    let mut u: u32 = 0;
+                    while p < chunk.len() && chunk[p] >= b'0' && chunk[p] <= b'9' {
+                        u = u * 10 + (chunk[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    // Skip space(s)
+                    while p < chunk.len() && (chunk[p] == b' ' || chunk[p] == b'\r') {
+                        p += 1;
+                    }
+                    // Parse v
+                    let mut v: u32 = 0;
+                    while p < chunk.len() && chunk[p] >= b'0' && chunk[p] <= b'9' {
+                        v = v * 10 + (chunk[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    // Skip space(s)
+                    while p < chunk.len() && (chunk[p] == b' ' || chunk[p] == b'\r') {
+                        p += 1;
+                    }
+                    // Parse w
+                    let mut w: u32 = 0;
+                    while p < chunk.len() && chunk[p] >= b'0' && chunk[p] <= b'9' {
+                        w = w * 10 + (chunk[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    // Skip rest of line
+                    while p < chunk.len() && chunk[p] != b'\n' {
+                        p += 1;
+                    }
+                    if p < chunk.len() {
+                        p += 1; // skip '\n'
+                    }
+
+                    let fwd_dest =
+                        cursor_out_ref[u as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                    let fwd_packed = ((v as u64) << 32) | (w as u64);
+                    fwd_edges_ref[fwd_dest].store(fwd_packed, Ordering::Relaxed);
+
+                    let rev_dest =
+                        cursor_in_ref[v as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                    let rev_packed = ((u as u64) << 32) | (w as u64);
+                    rev_edges_ref[rev_dest].store(rev_packed, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    drop(cursor_out);
+    drop(cursor_in);
     drop(graph_bytes);
 
-    // Parse queries
+    // ── Parse queries ─────────────────────────────────────────────────────────
     let mut queries = Vec::new();
     let mut pq = 0;
     while pq < query_bytes.len() {
@@ -140,8 +284,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n_threads = std::thread::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(1)
-            .min(q_len)
-            .max(1);
+            .max(1)
+            .min(q_len);
 
         let next_query = AtomicUsize::new(0);
 
@@ -150,9 +294,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..n_threads {
                 handles.push(s.spawn(|| {
                     let mut local_results = Vec::new();
-                    let mut dist = vec![u64::MAX; n];
-                    let mut touched = Vec::new();
-                    let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+                    let mut dist_f = vec![u64::MAX; n];
+                    let mut dist_b = vec![u64::MAX; n];
+                    let mut touched_f = Vec::new();
+                    let mut touched_b = Vec::new();
+                    let mut heap_f: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
+                    let mut heap_b: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
 
                     loop {
                         let idx = next_query.fetch_add(1, Ordering::Relaxed);
@@ -165,42 +312,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        dist[qs as usize] = 0;
-                        touched.push(qs);
-                        heap.push(Reverse((0, qs)));
+                        dist_f[qs as usize] = 0;
+                        touched_f.push(qs);
+                        heap_f.push(Reverse((0, qs)));
 
-                        let mut found = None;
+                        dist_b[qt as usize] = 0;
+                        touched_b.push(qt);
+                        heap_b.push(Reverse((0, qt)));
 
-                        while let Some(Reverse((d, u))) = heap.pop() {
-                            if d > dist[u as usize] {
-                                continue;
+                        let mut mu = u64::MAX;
+                        let mut settled_f = 0u64;
+                        let mut settled_b = 0u64;
+
+                        loop {
+                            // Pop stale entries from the top of both heaps
+                            while let Some(&Reverse((d, u))) = heap_f.peek() {
+                                if d > dist_f[u as usize] {
+                                    heap_f.pop();
+                                } else {
+                                    break;
+                                }
                             }
-                            if u == qt {
-                                found = Some(d);
+                            while let Some(&Reverse((d, u))) = heap_b.peek() {
+                                if d > dist_b[u as usize] {
+                                    heap_b.pop();
+                                } else {
+                                    break;
+                                }
+                            }
+
+                            // If either heap is empty, stop
+                            let (tf, tb) = match (heap_f.peek(), heap_b.peek()) {
+                                (Some(&Reverse((tf, _))), Some(&Reverse((tb, _)))) => (tf, tb),
+                                _ => break,
+                            };
+
+                            // If tf.saturating_add(tb) >= mu, stop
+                            if tf.saturating_add(tb) >= mu {
                                 break;
                             }
-                            let start = offsets[u as usize] as usize;
-                            let end = offsets[u as usize + 1] as usize;
-                            for edge_idx in start..end {
-                                let (v, w) = edges[edge_idx];
-                                let nd = d + w as u64;
-                                if nd < dist[v as usize] {
-                                    if dist[v as usize] == u64::MAX {
-                                        touched.push(v);
+
+                            // Expand side that has settled FEWER nodes so far (ties: forward)
+                            if settled_f <= settled_b {
+                                let Reverse((d, u)) = heap_f.pop().unwrap();
+                                settled_f += 1;
+
+                                let start = out_offsets[u as usize] as usize;
+                                let end = out_offsets[u as usize + 1] as usize;
+                                for edge_idx in start..end {
+                                    let x = fwd_edges[edge_idx].load(Ordering::Relaxed);
+                                    let v = (x >> 32) as u32;
+                                    let w = (x & 0xFFFF_FFFF) as u32;
+                                    let nd = d.saturating_add(w as u64);
+                                    if nd < dist_f[v as usize] {
+                                        if dist_f[v as usize] == u64::MAX {
+                                            touched_f.push(v);
+                                        }
+                                        dist_f[v as usize] = nd;
+                                        heap_f.push(Reverse((nd, v)));
+
+                                        let other = dist_b[v as usize];
+                                        if other != u64::MAX {
+                                            let cand = nd.saturating_add(other);
+                                            if cand < mu {
+                                                mu = cand;
+                                            }
+                                        }
                                     }
-                                    dist[v as usize] = nd;
-                                    heap.push(Reverse((nd, v)));
+                                }
+                            } else {
+                                let Reverse((d, u)) = heap_b.pop().unwrap();
+                                settled_b += 1;
+
+                                let start = in_offsets[u as usize] as usize;
+                                let end = in_offsets[u as usize + 1] as usize;
+                                for edge_idx in start..end {
+                                    let x = rev_edges[edge_idx].load(Ordering::Relaxed);
+                                    let tail = (x >> 32) as u32;
+                                    let w = (x & 0xFFFF_FFFF) as u32;
+                                    let nd = d.saturating_add(w as u64);
+                                    if nd < dist_b[tail as usize] {
+                                        if dist_b[tail as usize] == u64::MAX {
+                                            touched_b.push(tail);
+                                        }
+                                        dist_b[tail as usize] = nd;
+                                        heap_b.push(Reverse((nd, tail)));
+
+                                        let other = dist_f[tail as usize];
+                                        if other != u64::MAX {
+                                            let cand = nd.saturating_add(other);
+                                            if cand < mu {
+                                                mu = cand;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
 
-                        heap.clear();
-                        for &u in &touched {
-                            dist[u as usize] = u64::MAX;
-                        }
-                        touched.clear();
+                        let ans = if mu == u64::MAX { None } else { Some(mu) };
 
-                        local_results.push((idx, found));
+                        heap_f.clear();
+                        heap_b.clear();
+                        for &u in &touched_f {
+                            dist_f[u as usize] = u64::MAX;
+                        }
+                        touched_f.clear();
+                        for &u in &touched_b {
+                            dist_b[u as usize] = u64::MAX;
+                        }
+                        touched_b.clear();
+
+                        local_results.push((idx, ans));
                     }
                     local_results
                 }));
@@ -215,7 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Write output
+    // ── Write output ──────────────────────────────────────────────────────────
     std::fs::create_dir_all(&out_dir)?;
     let out_file_path = out_dir.join("distances.txt");
     let mut out_file = BufWriter::new(File::create(&out_file_path)?);
