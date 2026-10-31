@@ -1,47 +1,39 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 const BOM: &[u8] = b"\xef\xbb\xbf";
 const UNMATCHED: &str = "_UNMATCHED";
 const MAX_REGION: usize = 1_000_000;
 const BUF_SIZE: usize = 1024 * 1024;
 
-#[derive(Default)]
-struct MyHasher(u64);
-
-impl Hasher for MyHasher {
-    #[inline]
-    fn finish(&self) -> u64 {
-        self.0
+#[inline]
+fn hash_bytes(b: &[u8]) -> u64 {
+    let mut h = 0x9E3779B97F4A7C15u64 ^ (b.len() as u64).wrapping_mul(0xBF58476D1CE4E5B9u64);
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let prod = ((h ^ w) as u128).wrapping_mul(0x94D049BB133111EBu128);
+        h = (prod as u64) ^ ((prod >> 64) as u64);
+        i += 8;
     }
-
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = self.0;
-        let mut i = 0;
-        while i + 8 <= bytes.len() {
-            let word = u64::from_ne_bytes(bytes[i..i + 8].try_into().unwrap());
-            hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x517cc1b727220a95);
-            i += 8;
-        }
-        if i + 4 <= bytes.len() {
-            let word = u32::from_ne_bytes(bytes[i..i + 4].try_into().unwrap()) as u64;
-            hash = (hash.rotate_left(5) ^ word).wrapping_mul(0x517cc1b727220a95);
-            i += 4;
-        }
-        while i < bytes.len() {
-            hash = (hash.rotate_left(5) ^ (bytes[i] as u64)).wrapping_mul(0x517cc1b727220a95);
-            i += 1;
-        }
-        self.0 = hash;
+    let rem = &b[i..];
+    if !rem.is_empty() {
+        let mut tail = [0u8; 8];
+        tail[..rem.len()].copy_from_slice(rem);
+        let w = u64::from_le_bytes(tail);
+        let prod = ((h ^ w) as u128).wrapping_mul(0x94D049BB133111EBu128);
+        h = (prod as u64) ^ ((prod >> 64) as u64);
     }
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xD6E8FEB86659FD93u64);
+    h ^= h >> 32;
+    h
 }
-
-type NameDictionary = HashMap<Vec<u8>, u32, BuildHasherDefault<MyHasher>>;
 
 #[derive(Default)]
 struct CountryStats {
@@ -50,14 +42,13 @@ struct CountryStats {
     amount_sum: i64,
     amount_min: Option<i64>,
     amount_max: Option<i64>,
-    name_bits: Vec<u64>,
     name_bytes: u64,
     note_bytes: u64,
 }
 
 impl CountryStats {
     #[inline]
-    fn add(&mut self, id: u64, name_id: u32, name_len: u64, note_len: u64, cents: i64) {
+    fn add(&mut self, id: u64, name_len: u64, note_len: u64, cents: i64) {
         self.count += 1;
         self.id_sum += id;
         self.amount_sum += cents;
@@ -71,17 +62,6 @@ impl CountryStats {
         });
         self.name_bytes += name_len;
         self.note_bytes += note_len;
-
-        let word_idx = (name_id / 64) as usize;
-        let bit_mask = 1u64 << (name_id % 64);
-        if word_idx >= self.name_bits.len() {
-            self.name_bits.resize(word_idx + 1, 0);
-        }
-        self.name_bits[word_idx] |= bit_mask;
-    }
-
-    fn distinct_names(&self) -> u64 {
-        self.name_bits.iter().map(|w| w.count_ones() as u64).sum()
     }
 }
 
@@ -149,25 +129,23 @@ fn load_regions(path: &Path) -> Result<RegionTable, Box<dyn std::error::Error>> 
 
 struct RecordParser<'a> {
     country_stats: Vec<CountryStats>,
-    local_names: Vec<Vec<u8>>,
-    names_dict: NameDictionary,
+    hashes: Vec<Vec<u64>>,
     scratch_name: Vec<u8>,
     regions: &'a RegionTable,
 }
 
 impl<'a> RecordParser<'a> {
     fn new(regions: &'a RegionTable) -> Self {
-        let country_stats: Vec<CountryStats> = (0..regions.country_names.len())
+        let num_countries = regions.country_names.len();
+        let country_stats: Vec<CountryStats> = (0..num_countries)
             .map(|_| CountryStats::default())
             .collect();
-        let local_names: Vec<Vec<u8>> = Vec::new();
-        let names_dict: NameDictionary = HashMap::default();
+        let hashes: Vec<Vec<u64>> = (0..num_countries).map(|_| Vec::new()).collect();
         let scratch_name: Vec<u8> = Vec::with_capacity(64);
 
         Self {
             country_stats,
-            local_names,
-            names_dict,
+            hashes,
             scratch_name,
             regions,
         }
@@ -248,15 +226,7 @@ impl<'a> RecordParser<'a> {
                 pos += 1;
             }
 
-            let name_id = if let Some(&nid) = self.names_dict.get(name_slice) {
-                nid
-            } else {
-                let nid = self.local_names.len() as u32;
-                let vec_name = name_slice.to_vec();
-                self.names_dict.insert(vec_name.clone(), nid);
-                self.local_names.push(vec_name);
-                nid
-            };
+            let name_h = hash_bytes(name_slice);
 
             // 3. note
             let mut note_len: u64 = 0;
@@ -340,12 +310,13 @@ impl<'a> RecordParser<'a> {
             } else {
                 self.regions.unmatched_cid
             };
-            self.country_stats[cid as usize].add(id, name_id, name_len, note_len, cents);
+            self.country_stats[cid as usize].add(id, name_len, note_len, cents);
+            self.hashes[cid as usize].push(name_h);
         }
     }
 
-    fn finish(self) -> (Vec<CountryStats>, Vec<Vec<u8>>) {
-        (self.country_stats, self.local_names)
+    fn finish(self) -> (Vec<CountryStats>, Vec<Vec<u64>>) {
+        (self.country_stats, self.hashes)
     }
 }
 
@@ -355,7 +326,7 @@ fn stream_chunk(
     len: u64,
     buf_size: usize,
     regions: &RegionTable,
-) -> Result<(Vec<CountryStats>, Vec<Vec<u8>>), std::io::Error> {
+) -> Result<(Vec<CountryStats>, Vec<Vec<u64>>), std::io::Error> {
     let mut parser = RecordParser::new(regions);
     if len == 0 {
         return Ok(parser.finish());
@@ -566,7 +537,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // PHASE 3 (parallel parsing): parse chunks
-    let thread_results: Vec<(Vec<CountryStats>, Vec<Vec<u8>>)> = if n <= 1 {
+    let thread_results: Vec<(Vec<CountryStats>, Vec<Vec<u64>>)> = if n <= 1 {
         vec![stream_chunk(
             &records_path,
             starts[0],
@@ -591,26 +562,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // PHASE 4 (merge on main thread)
+    // PHASE 4 (merge on main thread + parallel country deduplication)
     let num_countries = regions.country_names.len();
     let mut global_stats: Vec<CountryStats> = (0..num_countries)
         .map(|_| CountryStats::default())
         .collect();
-    let mut global_dict: NameDictionary = HashMap::default();
 
-    for (thread_stats, local_names) in thread_results {
-        let mut local_to_global: Vec<u32> = Vec::with_capacity(local_names.len());
-        for name in local_names {
-            let gid = if let Some(&gid) = global_dict.get(&name[..]) {
-                gid
-            } else {
-                let gid = global_dict.len() as u32;
-                global_dict.insert(name, gid);
-                gid
-            };
-            local_to_global.push(gid);
-        }
+    let country_hash_vecs: Vec<Mutex<Vec<Vec<u64>>>> =
+        (0..num_countries).map(|_| Mutex::new(Vec::new())).collect();
 
+    for (thread_stats, thread_hashes) in thread_results {
         for (cid, t_stats) in thread_stats.into_iter().enumerate() {
             if t_stats.count == 0 {
                 continue;
@@ -633,49 +594,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             g_stats.name_bytes += t_stats.name_bytes;
             g_stats.note_bytes += t_stats.note_bytes;
+        }
 
-            for (w_idx, &word) in t_stats.name_bits.iter().enumerate() {
-                let mut w = word;
-                while w != 0 {
-                    let bit = w.trailing_zeros();
-                    let local_id = (w_idx * 64 + bit as usize) as u32;
-                    let global_id = local_to_global[local_id as usize];
-
-                    let gw_idx = (global_id / 64) as usize;
-                    let gbit_mask = 1u64 << (global_id % 64);
-                    if gw_idx >= g_stats.name_bits.len() {
-                        g_stats.name_bits.resize(gw_idx + 1, 0);
-                    }
-                    g_stats.name_bits[gw_idx] |= gbit_mask;
-
-                    w &= w - 1;
-                }
+        for (cid, hvec) in thread_hashes.into_iter().enumerate() {
+            if !hvec.is_empty() {
+                country_hash_vecs[cid].lock().unwrap().push(hvec);
             }
         }
     }
 
-    let mut active: Vec<(&String, &CountryStats)> = regions
-        .country_names
+    let distinct_counts: Vec<AtomicU64> = (0..num_countries).map(|_| AtomicU64::new(0)).collect();
+    let next_country = AtomicUsize::new(0);
+
+    if n > 1 {
+        std::thread::scope(|s| {
+            for _ in 0..n {
+                s.spawn(|| loop {
+                    let c = next_country.fetch_add(1, Ordering::Relaxed);
+                    if c >= num_countries {
+                        break;
+                    }
+                    let vecs = std::mem::take(&mut *country_hash_vecs[c].lock().unwrap());
+                    if vecs.is_empty() {
+                        continue;
+                    }
+                    let total_len: usize = vecs.iter().map(|v| v.len()).sum();
+                    let mut combined = Vec::with_capacity(total_len);
+                    for v in vecs {
+                        combined.extend(v);
+                    }
+                    combined.sort_unstable();
+                    combined.dedup();
+                    distinct_counts[c].store(combined.len() as u64, Ordering::Relaxed);
+                });
+            }
+        });
+    } else {
+        for c in 0..num_countries {
+            let vecs = std::mem::take(&mut *country_hash_vecs[c].lock().unwrap());
+            if vecs.is_empty() {
+                continue;
+            }
+            let total_len: usize = vecs.iter().map(|v| v.len()).sum();
+            let mut combined = Vec::with_capacity(total_len);
+            for v in vecs {
+                combined.extend(v);
+            }
+            combined.sort_unstable();
+            combined.dedup();
+            distinct_counts[c].store(combined.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    let mut active: Vec<(usize, &CountryStats)> = global_stats
         .iter()
-        .zip(global_stats.iter())
+        .enumerate()
         .filter(|(_, stats)| stats.count > 0)
         .collect();
-    active.sort_by_key(|(name, _)| *name);
+    active.sort_by_key(|&(cid, _)| &regions.country_names[cid]);
 
     std::fs::create_dir_all(&out_dir)?;
     let out_file_path = out_dir.join("aggregates.txt");
     let mut out_file = File::create(&out_file_path)?;
 
-    for (key, stats) in active {
+    for (cid, stats) in active {
         let line = format!(
             "{} {} {} {} {} {} {} {} {}\n",
-            key,
+            regions.country_names[cid],
             stats.count,
             stats.id_sum,
             format_cents(stats.amount_sum),
             format_cents(stats.amount_min.unwrap_or(0)),
             format_cents(stats.amount_max.unwrap_or(0)),
-            stats.distinct_names(),
+            distinct_counts[cid].load(Ordering::Relaxed),
             stats.name_bytes,
             stats.note_bytes
         );

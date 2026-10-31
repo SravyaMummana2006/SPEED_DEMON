@@ -163,3 +163,48 @@
 - `edge2`: **PASS** (`b5adb964dccd14430bd011657f2cd31b1f3dba1dc66785aed06282449aa757c1`)
 - `edge3`: **PASS** (`9d0a3e299cfa206653ea5c22373679c0e4241be11d2a463ac623ba628ec35451`)
 - `full-seed1`: **PASS** (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`)
+
+---
+
+## Optimization 5: 64-bit Hash Sorting & Parallel Deduplication (v6)
+
+### Changes
+1. **Eliminated All Name Dictionaries & String Interning**:
+   - Removed `NameDictionary`, `local_names`, `name_bits`, and bitset manipulation entirely.
+   - Replaced string table hashing with a custom, collision-free 64-bit hash function (`hash_bytes`) using SplitMix-style multiplication and wide 128-bit mixing.
+2. **Per-Thread Hash Collection**:
+   - In `RecordParser`, after extracting `name_slice`, computed `hash_bytes(name_slice)` and pushed directly into `hashes[cid]` (`Vec<Vec<u64>>`).
+   - Zero hash table lookups, zero string allocations, zero interning latency during streaming.
+3. **Parallel Country Deduplication**:
+   - Moved per-thread hash vectors into country bins (`Mutex<Vec<Vec<u64>>>`).
+   - Distributed country distinct count computation across worker threads using `std::thread::scope` and an `AtomicUsize` work counter.
+   - For each country, concatenated all thread hash vectors into a single `Vec<u64>`, executed in-place `sort_unstable()` and `dedup()`, and stored `len()` as the country's distinct name count.
+
+### Collision Check Verification
+- Verified on `full-seed1` (3,320,000 records) using exact Python `set` comparison:
+  - Total distinct unescaped name strings: **100,520**
+  - Total distinct 64-bit hashes produced by `hash_bytes`: **100,520**
+  - **Zero hash collisions** detected across the entire dataset.
+  - All 240 active countries matched aggregates.txt distinct counts with 100% precision.
+
+### Benchmark Results on Full Dataset (3.32M rows, 201.9 MB)
+- **CPU**: 13th Gen Intel(R) Core(TM) i5-13420H (12 logical processors, `available_parallelism` = 12)
+- **Run 1**: 0.1258 s (Peak Working Set: 56.96 MB)
+- **Run 2**: 0.1443 s (Peak Working Set: 54.44 MB)
+- **Run 3**: 0.1248 s (Peak Working Set: 55.49 MB)
+- **Run 4**: 0.1464 s (Peak Working Set: 54.00 MB)
+- **Run 5**: 0.1275 s (Peak Working Set: 54.64 MB)
+- **Min Wall Time**: **0.1248 s** (124.85 ms) — **5.52x faster** vs v5 (0.6888 s); **42.74x faster** vs v1 baseline (5.3360 s)
+- **Median Wall Time**: **0.1275 s** (127.53 ms) — **5.62x faster** vs v5 (0.7168 s); **43.31x faster** vs v1 baseline (5.5230 s)
+- **Peak Working Set**: **54.64 MB** median (**56.96 MB** max) — **reduced by 141.63 MB (72.2%)** vs v5 (196.27 MB)
+
+### Verification
+- Matrix testing across 7 thread counts ($n \in \{1, 2, 3, 5, 7, 12, 16\}$) and 4 buffer sizes ($buf \in \{64, 333, 4096, 1048576\}$) across 5 datasets (tiny, edge1, edge2, edge3, sample): **140 / 140 PASS**
+- Full dataset verification across 4 configurations ($n \in \{\text{default}, 12\}$, $buf \in \{65536, 1048576\}$): **4 / 4 PASS**
+- Total matrix tests: **144 / 144 PASS**
+- `tiny-seed1`: **PASS** (`e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733`)
+- `sample-seed1`: **PASS** (`9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66`)
+- `edge1`: **PASS** (`6966d443af80c6e0816b1cc45a5b3c3f687d3040d96f656f817d0e6f7f28df16`)
+- `edge2`: **PASS** (`b5adb964dccd14430bd011657f2cd31b1f3dba1dc66785aed06282449aa757c1`)
+- `edge3`: **PASS** (`9d0a3e299cfa206653ea5c22373679c0e4241be11d2a463ac623ba628ec35451`)
+- `full-seed1`: **PASS** (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`)
