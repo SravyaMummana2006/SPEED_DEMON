@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 #[derive(Default)]
 struct MyHasher(u64);
@@ -219,6 +221,48 @@ fn stream_chunk(
     parser.finish()
 }
 
+#[inline(always)]
+fn write_u32(buf: &mut Vec<u8>, mut val: u32) {
+    if val == 0 {
+        buf.push(b'0');
+        return;
+    }
+    let mut tmp = [0u8; 10];
+    let mut i = 0;
+    while val > 0 {
+        tmp[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        buf.push(tmp[i]);
+    }
+}
+
+#[inline(always)]
+fn write_date(buf: &mut Vec<u8>, hour_key: u32) {
+    let y = hour_key / 1_000_000;
+    let m = (hour_key / 10_000) % 100;
+    let d = (hour_key / 100) % 100;
+    let h = hour_key % 100;
+
+    buf.push(b'0' + (y / 1000) as u8);
+    buf.push(b'0' + ((y / 100) % 10) as u8);
+    buf.push(b'0' + ((y / 10) % 10) as u8);
+    buf.push(b'0' + (y % 10) as u8);
+    buf.push(b'-');
+    buf.push(b'0' + (m / 10) as u8);
+    buf.push(b'0' + (m % 10) as u8);
+    buf.push(b'-');
+    buf.push(b'0' + (d / 10) as u8);
+    buf.push(b'0' + (d % 10) as u8);
+    buf.push(b'T');
+    buf.push(b'0' + (h / 10) as u8);
+    buf.push(b'0' + (h % 10) as u8);
+    buf.extend_from_slice(b":00:00Z");
+}
+
 fn parse_args() -> (PathBuf, PathBuf) {
     let args: Vec<String> = env::args().collect();
     let mut data_dir = PathBuf::from("/data");
@@ -247,6 +291,13 @@ fn parse_args() -> (PathBuf, PathBuf) {
     }
 
     (data_dir, out_dir)
+}
+
+struct HourEntry {
+    rank: u32,
+    count: u32,
+    errors: u32,
+    latencies: Vec<u32>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -320,14 +371,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     };
 
-    // Merge on main thread
+    // ── Step 1: Global endpoints & rank ─────────────────────────────────────
     let mut global_endpoints: Vec<Vec<u8>> = Vec::new();
     let mut global_endpoint_dict: EndpointDictionary = HashMap::default();
 
-    let mut global_groups: Vec<Group> = Vec::new();
-    let mut global_group_map: GroupMap = HashMap::default();
-
-    for (local_endpoints, local_groups) in thread_results {
+    let mut all_local_to_global: Vec<Vec<u32>> = Vec::with_capacity(thread_results.len());
+    for (local_endpoints, _) in &thread_results {
         let mut local_to_global: Vec<u32> = Vec::with_capacity(local_endpoints.len());
         for ep in local_endpoints {
             let gid = if let Some(&gid) = global_endpoint_dict.get(&ep[..]) {
@@ -335,72 +384,156 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let gid = global_endpoints.len() as u32;
                 global_endpoint_dict.insert(ep.clone(), gid);
-                global_endpoints.push(ep);
+                global_endpoints.push(ep.clone());
                 gid
             };
             local_to_global.push(gid);
         }
+        all_local_to_global.push(local_to_global);
+    }
 
-        for lg in local_groups {
-            let global_endpoint_id = local_to_global[lg.endpoint_id as usize];
-            let group_key = ((lg.hour as u64) << 32) | (global_endpoint_id as u64);
+    let mut sorted_gids: Vec<u32> = (0..global_endpoints.len() as u32).collect();
+    sorted_gids
+        .sort_unstable_by(|&a, &b| global_endpoints[a as usize].cmp(&global_endpoints[b as usize]));
 
-            let group_idx = if let Some(&idx) = global_group_map.get(&group_key) {
-                idx
-            } else {
-                let idx = global_groups.len();
-                global_group_map.insert(group_key, idx);
-                global_groups.push(Group {
-                    hour: lg.hour,
-                    endpoint_id: global_endpoint_id,
-                    count: 0,
-                    errors: 0,
-                    latencies: Vec::new(),
-                });
-                idx
-            };
+    let mut rank = vec![0u32; global_endpoints.len()];
+    for (r, &gid) in sorted_gids.iter().enumerate() {
+        rank[gid as usize] = r as u32;
+    }
 
-            let gg = &mut global_groups[group_idx];
-            gg.count += lg.count;
-            gg.errors += lg.errors;
-            gg.latencies.extend(lg.latencies);
+    let sorted_endpoints: Vec<Vec<u8>> = sorted_gids
+        .iter()
+        .map(|&gid| global_endpoints[gid as usize].clone())
+        .collect();
+    drop(global_endpoints);
+    drop(global_endpoint_dict);
+
+    // ── Step 2: Bucket per hour & move groups ───────────────────────────────
+    let mut hour_keys: Vec<u32> = Vec::new();
+    for (_, groups) in &thread_results {
+        for g in groups {
+            hour_keys.push(g.hour);
+        }
+    }
+    hour_keys.sort_unstable();
+    hour_keys.dedup();
+
+    let num_hours = hour_keys.len();
+
+    let mut raw_buckets: Vec<Vec<HourEntry>> = (0..num_hours).map(|_| Vec::new()).collect();
+
+    for (t_idx, (_local_endpoints, local_groups)) in thread_results.into_iter().enumerate() {
+        let local_to_global = &all_local_to_global[t_idx];
+        for g in local_groups {
+            let gid = local_to_global[g.endpoint_id as usize];
+            let r = rank[gid as usize];
+            let h_idx = hour_keys.binary_search(&g.hour).unwrap();
+            raw_buckets[h_idx].push(HourEntry {
+                rank: r,
+                count: g.count,
+                errors: g.errors,
+                latencies: g.latencies,
+            });
         }
     }
 
-    // Sort groups by hour ascending, then endpoint bytes ascending
-    global_groups.sort_unstable_by(|a, b| match a.hour.cmp(&b.hour) {
-        std::cmp::Ordering::Equal => {
-            global_endpoints[a.endpoint_id as usize].cmp(&global_endpoints[b.endpoint_id as usize])
+    let hour_buckets: Vec<Mutex<Vec<HourEntry>>> =
+        raw_buckets.into_iter().map(Mutex::new).collect();
+
+    // ── Step 3: Parallel hour bucket processing ─────────────────────────────
+    let n_workers = n.min(num_hours).max(1);
+    let next_hour = AtomicUsize::new(0);
+
+    let thread_outputs: Vec<Vec<(usize, Vec<u8>)>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(n_workers);
+        for _ in 0..n_workers {
+            handles.push(s.spawn(|| {
+                let mut local_results = Vec::new();
+                loop {
+                    let h_idx = next_hour.fetch_add(1, Ordering::Relaxed);
+                    if h_idx >= num_hours {
+                        break;
+                    }
+                    let hour_key = hour_keys[h_idx];
+                    let mut bucket = std::mem::take(&mut *hour_buckets[h_idx].lock().unwrap());
+
+                    // Sort bucket by rank ascending
+                    bucket.sort_unstable_by_key(|e| e.rank);
+
+                    let mut hour_buf = Vec::with_capacity(bucket.len() * 70);
+
+                    // Merge entries with equal rank
+                    let mut i = 0;
+                    while i < bucket.len() {
+                        let mut j = i + 1;
+                        while j < bucket.len() && bucket[j].rank == bucket[i].rank {
+                            j += 1;
+                        }
+
+                        let rank_val = bucket[i].rank;
+                        let mut count = bucket[i].count;
+                        let mut errors = bucket[i].errors;
+                        let mut latencies = std::mem::take(&mut bucket[i].latencies);
+
+                        for k in (i + 1)..j {
+                            count += bucket[k].count;
+                            errors += bucket[k].errors;
+                            latencies.append(&mut bucket[k].latencies);
+                        }
+
+                        // Sort latencies
+                        latencies.sort_unstable();
+                        let lat_len = latencies.len();
+                        let rank_fn = |p: usize| (p * lat_len + 99) / 100;
+                        let p50 = latencies[rank_fn(50) - 1];
+                        let p95 = latencies[rank_fn(95) - 1];
+                        let p99 = latencies[rank_fn(99) - 1];
+                        let error_ppm = (errors as u64 * 1_000_000 / count as u64) as u32;
+
+                        let endpoint_bytes = &sorted_endpoints[rank_val as usize];
+
+                        write_date(&mut hour_buf, hour_key);
+                        hour_buf.push(b' ');
+                        hour_buf.extend_from_slice(endpoint_bytes);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, count);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, p50);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, p95);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, p99);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, errors);
+                        hour_buf.push(b' ');
+                        write_u32(&mut hour_buf, error_ppm);
+                        hour_buf.push(b'\n');
+
+                        i = j;
+                    }
+
+                    local_results.push((h_idx, hour_buf));
+                }
+                local_results
+            }));
         }
-        other => other,
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
-    std::fs::create_dir_all(&out_dir)?;
-    let out_file_path = out_dir.join("summary.txt");
-    let mut out_file = BufWriter::new(File::create(&out_file_path)?);
-
-    for mut g in global_groups {
-        g.latencies.sort_unstable();
-        let n = g.latencies.len();
-        let rank = |p: usize| (p * n + 99) / 100;
-        let p50 = g.latencies[rank(50) - 1];
-        let p95 = g.latencies[rank(95) - 1];
-        let p99 = g.latencies[rank(99) - 1];
-        let error_ppm = (g.errors as u64 * 1_000_000 / g.count as u64) as u32;
-
-        let y = g.hour / 1_000_000;
-        let m = (g.hour / 10_000) % 100;
-        let d = (g.hour / 100) % 100;
-        let h = g.hour % 100;
-
-        let endpoint_str = std::str::from_utf8(&global_endpoints[g.endpoint_id as usize]).unwrap();
-        writeln!(
-            out_file,
-            "{:04}-{:02}-{:02}T{:02}:00:00Z {} {} {} {} {} {} {}",
-            y, m, d, h, endpoint_str, g.count, p50, p95, p99, g.errors, error_ppm
-        )?;
+    let mut per_hour_buffers: Vec<Vec<u8>> = (0..num_hours).map(|_| Vec::new()).collect();
+    for thread_res in thread_outputs {
+        for (h_idx, buf) in thread_res {
+            per_hour_buffers[h_idx] = buf;
+        }
     }
 
-    out_file.flush()?;
+    // ── Step 4: Write per-hour buffers in hour order ─────────────────────────
+    std::fs::create_dir_all(&out_dir)?;
+    let out_file_path = out_dir.join("summary.txt");
+    let mut out_file = File::create(&out_file_path)?;
+    for buf in per_hour_buffers {
+        out_file.write_all(&buf)?;
+    }
+
     Ok(())
 }
