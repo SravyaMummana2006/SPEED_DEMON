@@ -103,11 +103,15 @@ fn stream_chunk(
 }
 
 fn main() {
-    let (mut data, mut out, mut args) = ("/data", "/out", std::env::args().skip(1));
+    let (mut data, mut out, mut pos, mut args) = ("/data", "/out", 0, std::env::args().skip(1));
     while let Some(a) = args.next() {
         if a == "--data" { if let Some(v) = args.next() { data = Box::leak(v.into_boxed_str()); } }
         else if a == "--out" { if let Some(v) = args.next() { out = Box::leak(v.into_boxed_str()); } }
-        else if !a.starts_with('-') { if data == "/data" { data = Box::leak(a.into_boxed_str()); } else { out = Box::leak(a.into_boxed_str()); } }
+        else if !a.starts_with('-') {
+            if pos == 0 { data = Box::leak(a.into_boxed_str()); }
+            else { out = Box::leak(a.into_boxed_str()); }
+            pos += 1;
+        }
     }
     let path = PathBuf::from(data).join("requests.log");
     let len = metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
