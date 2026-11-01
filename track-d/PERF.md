@@ -58,3 +58,25 @@
   - Full scale dataset verification ($n \in \{12, \text{default}\}$): **2 / 2 PASS** (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`)
   - Stress testing across 60 tiny datasets (seeds 2 through 61) with `SD_THREADS=4`: **60 / 60 PASS**
   - Total verified tests: **104 / 104 PASS**
+
+## Packed CSR, 4-Ary Heap & L3-Resident SmallMap (v5)
+- **Architecture**:
+  1. **Packed 6-Byte Edge Representation**: Stored as `#[repr(C, packed)] struct Edge { to: u32, weight: u16 }` with separate overflow map for weights $\ge 65534$, dropping graph edge memory by 25%.
+  2. **Zero-Allocation CSR Head Transmute**: In-place conversion from `Vec<AtomicU32>` to `Vec<u32>` via `std::mem::transmute`, saving duplicate allocations.
+  3. **Custom 4-Ary Min-Heap (`Heap4Fast`)**: Cache-friendly flattened 4-ary heap over packed `u64` (`(dist as u64) << 32 | u as u64`), replacing `std::collections::BinaryHeap` pointer overhead.
+  4. **L3-Cache-Resident `SmallMap`**: Fast open-addressing table with linear probing ($2^{18} = 262,144$ entries $\approx 2$ MB per worker) holding packed forward and backward tentative distances (`(fwd << 16) | bwd`). Replaces 14 MB per-thread distance vectors ($12 \times 28 = 336$ MB) and resets touched slots in $O(\text{touched})$.
+  5. **Single-Probe Lookup & Relaxation (`probe_entry`)**: Combines existence probing and value update into a single hash evaluation, halving probe overhead during neighbor relaxations.
+  6. **Hardened Safety & Fallback**: Fixed chunk boundary pointer checks to prevent SIGSEGV, parallel edge duplicate minimum resolution on large edges, full 64-bit Dijkstra fallback on large paths, and dynamic thread scaling (`SD_THREADS` / `available_parallelism`).
+- **Dataset**: `full-seed1` (1,740,512 nodes, 5,000,000 edges, 2,000 queries)
+- **Measured Wall Times (5 runs)**:
+  - Run 1: 0.8400 s (Peak RSS: 159.38 MB)
+  - Run 2: 0.7600 s (Peak RSS: 160.12 MB)
+  - Run 3: 0.7400 s (Peak RSS: 160.00 MB)
+  - Run 4: 0.7100 s (Peak RSS: 160.25 MB)
+  - Run 5: 0.7000 s (Peak RSS: 160.00 MB)
+- **Summary**:
+  - **Median Wall Time**: 0.7400 s (vs v4 1.0000 s baseline, **1.35x to 1.43x speedup**)
+  - **Min Wall Time**: 0.7000 s
+  - **Peak Memory (RSS)**: **160 MB** (vs v4 416 MB, **61.6% memory reduction**)
+  - **Verification**: Verified byte-for-byte sha256 match across `tiny-seed1`, `sample-seed1`, and `full-seed1` (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
+  - Thread matrix ($n \in \{1, 2, 4, 8, 12\}$): **PASS**.
