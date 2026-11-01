@@ -45,6 +45,7 @@ fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
 }
 
 /// Shared 4096-slot hash table lookup with compare_exchange.
+#[inline]
 fn get_slot(tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>, eh: u64, b: &[u8]) -> usize {
     let mut i = ((eh >> 20) as usize) & 4095;
     loop {
@@ -75,6 +76,8 @@ fn stream_chunk(
         std::array::from_fn(|_| Vec::new()),
         std::array::from_fn(|_| Vec::new()),
     );
+    let mut local_cache: [(u64, u16); 512] = [(0, 0); 512];
+
     if s1 > s0 {
         let mut f = File::open(path).unwrap();
         f.seek(Start(s0 as u64)).unwrap();
@@ -98,15 +101,39 @@ fn stream_chunk(
                     let off = if b[p + 6] == b'0' { d - 30 } else { d + 1 };
                     let h = off * 24 + ((b[p + 11] - b'0') * 10 + b[p + 12] - b'0') as usize;
                     p += 28;
-                    while b[p] != b' ' {
-                        p += 1;
-                    }
+                    // Fast HTTP method scan
+                    p = if b[p + 3] == b' ' {
+                        p + 3
+                    } else if b[p + 4] == b' ' {
+                        p + 4
+                    } else if b[p + 6] == b' ' {
+                        p + 6
+                    } else if b[p + 7] == b' ' {
+                        p + 7
+                    } else if b[p + 5] == b' ' {
+                        p + 5
+                    } else {
+                        while b[p] != b' ' { p += 1; }
+                        p
+                    };
+
                     let (eh, ep_len, np) = hash_ep(b, p + 1);
-                    let slot = get_slot(tab, ep, eh, &b[p + 1..p + 1 + ep_len]);
+                    let c_idx = (eh as usize) & 511;
+                    let slot = if local_cache[c_idx].0 == eh {
+                        local_cache[c_idx].1 as usize
+                    } else {
+                        let s = get_slot(tab, ep, eh, &b[p + 1..p + 1 + ep_len]);
+                        local_cache[c_idx] = (eh, s as u16);
+                        s
+                    };
+
                     p = np + 4;
                     let mut lat = 0u32;
-                    while b[p] != b'\n' {
+                    while b[p] >= b'0' && b[p] <= b'9' {
                         lat = lat * 10 + (b[p] - b'0') as u32;
+                        p += 1;
+                    }
+                    if b[p] == b'\r' {
                         p += 1;
                     }
                     bk.1[h].push(((slot as u16) << 1) | (b[np] == b'5') as u16);
@@ -123,12 +150,24 @@ fn stream_chunk(
 }
 
 fn main() {
-    let av: Vec<String> = args().collect();
-    let (data, out) = (
-        av.get(1).map_or("/data", |s| s),
-        av.get(2).map_or("/out", |s| s),
-    );
-    let path = PathBuf::from(data).join("requests.log");
+    let mut data = "/data".to_string();
+    let mut out = "/out".to_string();
+    let mut args = args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--data" {
+            if let Some(v) = args.next() { data = v; }
+        } else if arg == "--out" {
+            if let Some(v) = args.next() { out = v; }
+        } else if !arg.starts_with('-') {
+            if data == "/data" {
+                data = arg;
+            } else {
+                out = arg;
+            }
+        }
+    }
+
+    let path = PathBuf::from(&data).join("requests.log");
     let len = metadata(&path).map(|m| m.len() as usize).unwrap_or(0);
     let n = std::thread::available_parallelism().map_or(1, |p| p.get());
 
@@ -186,8 +225,8 @@ fn main() {
     let (slots, writer, next) = (
         (0..96).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
         Mutex::new((0, {
-            create_dir_all(out).unwrap();
-            File::create(PathBuf::from(out).join("summary.txt")).unwrap()
+            create_dir_all(&out).unwrap();
+            File::create(PathBuf::from(&out).join("summary.txt")).unwrap()
         })),
         AtomicUsize::new(0),
     );
