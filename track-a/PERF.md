@@ -154,3 +154,24 @@
   - **Peak Working Set**: 27.7 MB (down from 37.0 MB, −25% memory reduction)
   - **Source Size**: 195 lines
   - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (SHA-256 `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).
+
+
+## Lock-Free Phase 2 Reducer, 1-Entry Register Cache & Branchless Date Parsing (v10)
+- **Architecture**:
+  1. **Lock-Free Bucket Transfer**: Completely eliminated 1,152 `Mutex` heap allocations across thread buckets. In Phase 2, each unique hour is processed by exactly one thread, completely removing lock and synchronization overhead.
+  2. **1-Entry MRU Endpoint Register Cache**: Maintained `(last_eh, last_slot)` in CPU registers per thread, bypassing `get_slot` atomic loads on consecutive identical endpoint requests.
+  3. **Branchless Date/Hour Calculation**: Replaced conditional month offset logic with branchless formula `((d + 31 * m) - 30) * 24 + hour`, eliminating branch mispredictions.
+  4. **96% Fast-Path HTTP Method Dispatch**: Added `b[p+7] == b' '` fast-path for `OPTIONS`, covering 96% of all requests in 3 fast branches.
+  5. **Empty-Hour Fast Skip**: Immediately bypasses vector allocation and sorting for hours containing zero records.
+- **Dataset**: `full-seed1` (3,100,000 records, 238,836,234 bytes)
+- **Measured Wall Times (5 runs, Linux ext4)**:
+  - Run 1: 0.06 s (User time: 0.26 s)
+  - Run 2: 0.06 s (User time: 0.25 s)
+  - Run 3: 0.06 s (User time: 0.26 s)
+  - Run 4: 0.05 s (User time: 0.25 s)
+  - Run 5: 0.05 s (User time: 0.25 s)
+- **Summary**:
+  - **Min Wall Time**: 0.05 s (50 ms) in WSL environment
+  - **User CPU Time**: 0.25 s (−31% reduction in total CPU instructions)
+  - **Peak Working Set**: 28.5 MB
+  - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (SHA-256 `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).

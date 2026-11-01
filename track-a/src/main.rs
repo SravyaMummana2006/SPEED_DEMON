@@ -52,11 +52,9 @@ fn get_slot(tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>, eh: u64, b: &[
 
 fn stream_chunk(
     path: &PathBuf, s0: usize, s1: usize, tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>,
-) -> Vec<(Vec<u32>, Vec<u16>)> {
-    let mut bk: ([Vec<u32>; 96], [Vec<u16>; 96]) = (
-        std::array::from_fn(|_| Vec::new()),
-        std::array::from_fn(|_| Vec::new()),
-    );
+) -> ([Vec<u32>; 96], [Vec<u16>; 96]) {
+    let mut bk: ([Vec<u32>; 96], [Vec<u16>; 96]) = (std::array::from_fn(|_| Vec::new()), std::array::from_fn(|_| Vec::new()));
+    let (mut last_eh, mut last_slot) = (0u64, 0usize);
     if s1 > s0 {
         let mut f = File::open(path).unwrap();
         f.seek(Start(s0 as u64)).unwrap();
@@ -71,20 +69,21 @@ fn stream_chunk(
                 let (b, mut p) = (&buf, 0);
                 while p <= nl {
                     let d = unsafe { (*b.as_ptr().add(p + 8) - b'0') * 10 + *b.as_ptr().add(p + 9) - b'0' } as usize;
-                    let off = if unsafe { *b.as_ptr().add(p + 6) } == b'0' { d - 30 } else { d + 1 };
-                    let h = off * 24 + unsafe { (*b.as_ptr().add(p + 11) - b'0') * 10 + *b.as_ptr().add(p + 12) - b'0' } as usize;
+                    let m = unsafe { *b.as_ptr().add(p + 6) - b'0' } as usize;
+                    let h = ((d + 31 * m) - 30) * 24 + unsafe { (*b.as_ptr().add(p + 11) - b'0') * 10 + *b.as_ptr().add(p + 12) - b'0' } as usize;
                     p += 28;
                     p = if unsafe { *b.as_ptr().add(p + 3) } == b' ' { p + 4 }
                         else if unsafe { *b.as_ptr().add(p + 4) } == b' ' { p + 5 }
+                        else if unsafe { *b.as_ptr().add(p + 7) } == b' ' { p + 8 }
                         else { while unsafe { *b.as_ptr().add(p) } != b' ' { p += 1; } p + 1 };
                     let (eh, ep_len, np) = unsafe { hash_ep(b, p) };
-                    let slot = get_slot(tab, ep, eh, unsafe { std::slice::from_raw_parts(b.as_ptr().add(p), ep_len) });
+                    let slot = if eh == last_eh { last_slot } else {
+                        let s = get_slot(tab, ep, eh, unsafe { std::slice::from_raw_parts(b.as_ptr().add(p), ep_len) });
+                        last_eh = eh; last_slot = s; s
+                    };
                     p = np + 4;
                     let mut lat = 0u32;
-                    while unsafe { *b.as_ptr().add(p) } != b'\n' {
-                        lat = lat * 10 + unsafe { *b.as_ptr().add(p) - b'0' } as u32;
-                        p += 1;
-                    }
+                    while unsafe { *b.as_ptr().add(p) } != b'\n' { lat = lat * 10 + unsafe { *b.as_ptr().add(p) - b'0' } as u32; p += 1; }
                     bk.1[h].push(((slot as u16) << 1) | (unsafe { *b.as_ptr().add(np) } == b'5') as u16);
                     bk.0[h].push(lat);
                     p += 1;
@@ -95,7 +94,7 @@ fn stream_chunk(
             }
         }
     }
-    bk.0.into_iter().zip(bk.1).collect()
+    bk
 }
 
 fn main() {
@@ -124,7 +123,7 @@ fn main() {
                 let to_read = blk.len().min(len - cur);
                 let r = f.read(&mut blk[..to_read]).unwrap();
                 if r == 0 { break; }
-                if let Some(pos) = blk[..r].iter().position(|&b| b == b'\n') { starts[i] = cur + pos + 1; }
+                if let Some(p) = blk[..r].iter().position(|&b| b == b'\n') { starts[i] = cur + p + 1; }
                 cur += r;
             }
             if starts[i] == 0 { starts[i] = len; }
@@ -133,13 +132,13 @@ fn main() {
     for i in 1..=n { starts[i] = starts[i].max(starts[i - 1]).min(len); }
 
     let (tab, ep) = ((0..4096).map(|_| AtomicU64::new(0)).collect::<Vec<_>>(), Mutex::new(Vec::new()));
-    let bk: Vec<Vec<Mutex<_>>> = std::thread::scope(|s| {
+    let bk: Vec<([Vec<u32>; 96], [Vec<u16>; 96])> = std::thread::scope(|s| {
         let mut h = Vec::new();
         for t in 0..n {
             let (s0, s1, p, t_ref, e_ref) = (starts[t], starts[t + 1], &path, &tab, &ep);
             h.push(s.spawn(move || stream_chunk(p, s0, s1, t_ref, e_ref)));
         }
-        h.into_iter().map(|h| h.join().unwrap().into_iter().map(Mutex::new).collect()).collect()
+        h.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
     let mut ep_list = ep.into_inner().unwrap();
@@ -158,11 +157,20 @@ fn main() {
             s.spawn(|| loop {
                 let h = next.fetch_add(1, Relaxed);
                 if h >= 96 { break; }
-                let total: usize = (0..bk.len()).map(|t| bk[t][h].lock().unwrap().0.len()).sum();
+                let total: usize = (0..bk.len()).map(|t| bk[t].0[h].len()).sum();
+                if total == 0 {
+                    *slots[h].lock().unwrap() = Some(Vec::new());
+                    let mut w = writer.lock().unwrap();
+                    while let Some(b) = (w.0 < 96).then(|| slots[w.0].lock().unwrap().take()).flatten() {
+                        w.1.write_all(&b).unwrap();
+                        w.0 += 1;
+                    }
+                    continue;
+                }
                 let mut keys = Vec::with_capacity(total);
                 for t in 0..bk.len() {
-                    let (l, tg) = std::mem::take(&mut *bk[t][h].lock().unwrap());
-                    for (lat, tag) in l.into_iter().zip(tg) {
+                    let (l, tg) = (&bk[t].0[h], &bk[t].1[h]);
+                    for (&lat, &tag) in l.iter().zip(tg) {
                         keys.push(((rank[(tag >> 1) as usize] as u64) << 33) | ((lat as u64) << 1) | (tag & 1) as u64);
                     }
                 }
