@@ -1,3 +1,4 @@
+use std::arch::x86_64::*;
 use std::fs::{create_dir_all, metadata, File};
 use std::io::{Read, Seek, SeekFrom::Start, Write};
 use std::path::PathBuf;
@@ -24,11 +25,10 @@ unsafe fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
         if t != 0 {
             let k = (t.trailing_zeros() / 8) as usize;
             let m = if k == 0 { 0 } else { w & ((1u64 << (8 * k)) - 1) };
-            h = (h.rotate_left(23) ^ m).wrapping_mul(0x9E3779B97F4A7C15);
-            h = (h ^ (h >> 32)).wrapping_mul(0xD6E8FEB86659FD93);
-            return ((h ^ (h >> 32)) | 1, p + k - s, p + k + 1);
+            h = _mm_crc32_u64(h, m);
+            return ((h << 1) | 1, p + k - s, p + k + 1);
         }
-        h = (h.rotate_left(23) ^ w).wrapping_mul(0x9E3779B97F4A7C15);
+        h = _mm_crc32_u64(h, w);
         p += 8;
     }
 }
@@ -58,7 +58,7 @@ fn stream_chunk(
     if s1 > s0 {
         let mut f = File::open(path).unwrap();
         f.seek(Start(s0 as u64)).unwrap();
-        let (mut rdr, mut buf, mut filled) = (f.take((s1 - s0) as u64), vec![0u8; (128 * 1024) + 16], 0);
+        let (mut rdr, mut buf, mut filled) = (f.take((s1 - s0) as u64), vec![0u8; (64 * 1024) + 16], 0);
         loop {
             let lim = buf.len() - 16;
             if filled >= lim { buf.resize(buf.len() * 2 + 16, 0); continue; }

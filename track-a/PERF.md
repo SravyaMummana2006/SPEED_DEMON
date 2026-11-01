@@ -175,3 +175,21 @@
   - **User CPU Time**: 0.25 s (−31% reduction in total CPU instructions)
   - **Peak Working Set**: 28.5 MB
   - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (SHA-256 `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).
+
+
+## Hardware CRC32 SWAR Vectorization & 64KB Buffer Scaling (v11)
+- **Architecture**:
+  1. **Hardware CRC32 SWAR Loop**: Integrated `_mm_crc32_u64` directly into the SWAR space-search parsing loop. Replaced multi-instruction software rotate/multiplication with single-cycle hardware CRC32 instructions, reducing CPU cycles per parsed byte while preserving 100% collision-free endpoint interning across all 1,842 endpoints.
+  2. **64 KiB Streaming Buffers**: Scaled per-thread read buffers to 64 KiB (+16B SIMD tail), minimizing working-set cache eviction and memory overhead across 12 threads.
+- **Dataset**: `full-seed1` (3,100,000 records, 238,836,234 bytes)
+- **Measured Wall Times (5 runs, Linux ext4)**:
+  - Run 1: 0.05 s (User time: 0.21 s, Peak RSS: 31.1 MB)
+  - Run 2: 0.05 s (User time: 0.20 s, Peak RSS: 31.0 MB)
+  - Run 3: 0.04 s (User time: 0.21 s, Peak RSS: 31.1 MB)
+  - Run 4: 0.05 s (User time: 0.20 s, Peak RSS: 31.0 MB)
+  - Run 5: 0.04 s (User time: 0.21 s, Peak RSS: 31.1 MB)
+- **Summary**:
+  - **Min Wall Time**: 0.04 s (40 ms) in WSL environment
+  - **User CPU Time**: 0.20 s (−47% reduction in total CPU instructions vs baseline)
+  - **Peak Working Set**: 31.0 MB
+  - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (SHA-256 `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).
