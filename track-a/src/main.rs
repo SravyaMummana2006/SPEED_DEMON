@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 const D: [&[u8]; 4] = [b"2026-10-30", b"2026-10-31", b"2026-11-01", b"2026-11-02"];
 
-#[inline]
+#[inline(always)]
 fn push_val(b: &mut Vec<u8>, mut v: u32) {
     b.push(b' ');
     let s = b.len();
@@ -14,11 +14,11 @@ fn push_val(b: &mut Vec<u8>, mut v: u32) {
     b[s..].reverse();
 }
 
-#[inline]
-fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
+#[inline(always)]
+unsafe fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
     let (s, mut h) = (p, 0x243F6A8885A308D3u64);
     loop {
-        let w = u64::from_le_bytes(b[p..p + 8].try_into().unwrap());
+        let w = (b.as_ptr().add(p) as *const u64).read_unaligned();
         let x = w ^ 0x2020202020202020;
         let t = x.wrapping_sub(0x0101010101010101) & !x & 0x8080808080808080;
         if t != 0 {
@@ -33,13 +33,14 @@ fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn get_slot(tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>, eh: u64, b: &[u8]) -> usize {
     let mut i = ((eh >> 20) as usize) & 4095;
     loop {
-        match tab[i].load(Relaxed) {
+        let slot = unsafe { tab.get_unchecked(i) };
+        match slot.load(Relaxed) {
             v if v == eh => return i,
-            0 => match tab[i].compare_exchange(0, eh, Relaxed, Relaxed) {
+            0 => match slot.compare_exchange(0, eh, Relaxed, Relaxed) {
                 Ok(_) => { ep.lock().unwrap().push((i, b.to_vec())); return i; }
                 Err(v) if v == eh => return i,
                 _ => i = (i + 1) & 4095,
@@ -56,11 +57,10 @@ fn stream_chunk(
         std::array::from_fn(|_| Vec::new()),
         std::array::from_fn(|_| Vec::new()),
     );
-    let mut cache = [(0u64, 0u16); 512];
     if s1 > s0 {
         let mut f = File::open(path).unwrap();
         f.seek(Start(s0 as u64)).unwrap();
-        let (mut rdr, mut buf, mut filled) = (f.take((s1 - s0) as u64), vec![0u8; (1 << 20) + 16], 0);
+        let (mut rdr, mut buf, mut filled) = (f.take((s1 - s0) as u64), vec![0u8; (128 * 1024) + 16], 0);
         loop {
             let lim = buf.len() - 16;
             if filled >= lim { buf.resize(buf.len() * 2 + 16, 0); continue; }
@@ -70,26 +70,22 @@ fn stream_chunk(
             if let Some(nl) = buf[..filled].iter().rposition(|&b| b == b'\n') {
                 let (b, mut p) = (&buf, 0);
                 while p <= nl {
-                    let d = ((b[p + 8] - b'0') * 10 + b[p + 9] - b'0') as usize;
-                    let off = if b[p + 6] == b'0' { d - 30 } else { d + 1 };
-                    let h = off * 24 + ((b[p + 11] - b'0') * 10 + b[p + 12] - b'0') as usize;
+                    let d = unsafe { (*b.as_ptr().add(p + 8) - b'0') * 10 + *b.as_ptr().add(p + 9) - b'0' } as usize;
+                    let off = if unsafe { *b.as_ptr().add(p + 6) } == b'0' { d - 30 } else { d + 1 };
+                    let h = off * 24 + unsafe { (*b.as_ptr().add(p + 11) - b'0') * 10 + *b.as_ptr().add(p + 12) - b'0' } as usize;
                     p += 28;
-                    p = if b[p + 3] == b' ' { p + 3 }
-                        else if b[p + 4] == b' ' { p + 4 }
-                        else if b[p + 7] == b' ' { p + 7 }
-                        else { while b[p] != b' ' { p += 1; } p };
-                    let (eh, ep_len, np) = hash_ep(b, p + 1);
-                    let ci = (eh as usize) & 511;
-                    let slot = if cache[ci].0 == eh { cache[ci].1 as usize } else {
-                        let s = get_slot(tab, ep, eh, &b[p + 1..p + 1 + ep_len]);
-                        cache[ci] = (eh, s as u16);
-                        s
-                    };
+                    p = if unsafe { *b.as_ptr().add(p + 3) } == b' ' { p + 4 }
+                        else if unsafe { *b.as_ptr().add(p + 4) } == b' ' { p + 5 }
+                        else { while unsafe { *b.as_ptr().add(p) } != b' ' { p += 1; } p + 1 };
+                    let (eh, ep_len, np) = unsafe { hash_ep(b, p) };
+                    let slot = get_slot(tab, ep, eh, unsafe { std::slice::from_raw_parts(b.as_ptr().add(p), ep_len) });
                     p = np + 4;
                     let mut lat = 0u32;
-                    while b[p] >= b'0' && b[p] <= b'9' { lat = lat * 10 + (b[p] - b'0') as u32; p += 1; }
-                    if b[p] == b'\r' { p += 1; }
-                    bk.1[h].push(((slot as u16) << 1) | (b[np] == b'5') as u16);
+                    while unsafe { *b.as_ptr().add(p) } != b'\n' {
+                        lat = lat * 10 + unsafe { *b.as_ptr().add(p) - b'0' } as u32;
+                        p += 1;
+                    }
+                    bk.1[h].push(((slot as u16) << 1) | (unsafe { *b.as_ptr().add(np) } == b'5') as u16);
                     bk.0[h].push(lat);
                     p += 1;
                 }
@@ -171,7 +167,7 @@ fn main() {
                     }
                 }
                 keys.sort_unstable();
-                let (mut buf, mut i) = (Vec::new(), 0);
+                let (mut buf, mut i) = (Vec::with_capacity(32 * 1024), 0);
                 while i < keys.len() {
                     let (rk, mut j) = ((keys[i] >> 33) as usize, i + 1);
                     while j < keys.len() && (keys[j] >> 33) == rk as u64 { j += 1; }

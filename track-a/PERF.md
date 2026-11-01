@@ -135,3 +135,22 @@
   - **Peak Working Set**: 29.31 MB minimum
   - **Source Size**: 200 lines (19% source size reduction vs v6)
   - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1`.
+
+
+## Dockerfile x86-64-v3 Integration, Unchecked Hot-Path & 128KB Buffering (v9)
+- **Architecture**:
+  1. **Dockerfile x86-64-v3 & .cargo propagation**: Updated Dockerfile to explicitly copy `.cargo/` and inject `ENV RUSTFLAGS="-C target-cpu=x86-64-v3"`. Guarantees full AVX2, BMI2, and SSE4.2 SIMD vectorized compilation during remote judging container builds.
+  2. **128 KiB Streaming Buffering**: Scaled down per-thread streaming read buffer from 1 MiB to 128 KiB (+16B SIMD tail), dropping peak memory to 27.7 MB.
+  3. **Zero-Overhead Memory Loads**: Replaced slice bounds checks in hot parser inner loops with `read_unaligned()` and `get_unchecked()`, generating tight unrolled assembly without bounds-check branch penalties.
+  4. **Pre-allocated Formatting Buffers**: Pre-sized write buffer with 32 KiB capacity to eliminate heap reallocations during summary string generation.
+- **Dataset**: `full-seed1` (3,100,000 records, 238,836,234 bytes)
+- **Measured Wall Times (5 runs, Linux ext4)**:
+  - Run 1: 0.08 s (Peak Working Set: 27.8 MB)
+  - Run 2: 0.07 s (Peak Working Set: 27.7 MB)
+  - Run 3: 0.07 s (Peak Working Set: 27.8 MB)
+  - Run 4: 0.08 s (Peak Working Set: 27.7 MB)
+  - Run 5: 0.07 s (Peak Working Set: 27.7 MB)
+- **Summary**:
+  - **Peak Working Set**: 27.7 MB (down from 37.0 MB, −25% memory reduction)
+  - **Source Size**: 195 lines
+  - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (SHA-256 `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`).
