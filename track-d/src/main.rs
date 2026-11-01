@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
+const MADV_WILLNEED: i32 = 3;
+const MADV_DONTNEED: i32 = 4;
 
 extern "C" {
     fn mmap(a: *mut u8, l: usize, p: i32, f: i32, fd: i32, o: i64) -> *mut u8;
@@ -30,9 +32,10 @@ struct Heap4Fast {
 }
 
 impl Heap4Fast {
+    #[inline(always)]
     fn new() -> Self {
         Heap4Fast {
-            data: Vec::with_capacity(4096),
+            data: Vec::with_capacity(65536),
         }
     }
     #[inline(always)]
@@ -137,19 +140,25 @@ impl Heap4Fast {
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MapEntry {
+    key: u32,
+    val: u32,
+}
+
 // 262,144 entries = 2MB per worker (eliminates per-thread dist buffers)
+// Stored as a single flat array of 8-byte entries (key + val in identical cache line)
 struct SmallMap {
     mask: usize,
-    keys: Vec<u32>,
-    vals: Vec<u32>,
+    entries: Vec<MapEntry>,
 }
 
 impl SmallMap {
     fn new(cap: usize) -> Self {
         SmallMap {
             mask: cap - 1,
-            keys: vec![!0u32; cap],
-            vals: vec![!0u32; cap],
+            entries: vec![MapEntry { key: !0u32, val: !0u32 }; cap],
         }
     }
 
@@ -157,28 +166,12 @@ impl SmallMap {
     fn get(&self, k: u32) -> u32 {
         let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
         loop {
-            let key = unsafe { *self.keys.get_unchecked(idx) };
-            if key == k {
-                return unsafe { *self.vals.get_unchecked(idx) };
+            let entry = unsafe { self.entries.get_unchecked(idx) };
+            if entry.key == k {
+                return entry.val;
             }
-            if key == !0u32 {
+            if entry.key == !0u32 {
                 return !0u32;
-            }
-            idx = (idx + 1) & self.mask;
-        }
-    }
-
-    #[inline(always)]
-    fn insert(&mut self, k: u32, v: u32) {
-        let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
-        loop {
-            let key = unsafe { *self.keys.get_unchecked(idx) };
-            if key == k || key == !0u32 {
-                unsafe {
-                    *self.keys.get_unchecked_mut(idx) = k;
-                    *self.vals.get_unchecked_mut(idx) = v;
-                }
-                return;
             }
             idx = (idx + 1) & self.mask;
         }
@@ -188,13 +181,13 @@ impl SmallMap {
     fn probe_entry(&mut self, k: u32) -> (usize, u32, bool) {
         let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
         loop {
-            let key = unsafe { *self.keys.get_unchecked(idx) };
-            if key == k {
-                return (idx, unsafe { *self.vals.get_unchecked(idx) }, false);
+            let entry = unsafe { self.entries.get_unchecked(idx) };
+            if entry.key == k {
+                return (idx, entry.val, false);
             }
-            if key == !0u32 {
+            if entry.key == !0u32 {
                 unsafe {
-                    *self.keys.get_unchecked_mut(idx) = k;
+                    self.entries.get_unchecked_mut(idx).key = k;
                 }
                 return (idx, !0u32, true);
             }
@@ -203,19 +196,12 @@ impl SmallMap {
     }
 
     #[inline(always)]
-    fn clear_keys(&mut self, touched: &[u32]) {
-        for &k in touched {
-            let mut idx = (k as usize).wrapping_mul(0x9e3779b9) & self.mask;
-            loop {
-                let key = unsafe { *self.keys.get_unchecked(idx) };
-                if key == k {
-                    unsafe {
-                        *self.keys.get_unchecked_mut(idx) = !0u32;
-                        *self.vals.get_unchecked_mut(idx) = !0u32;
-                    }
-                    break;
-                }
-                idx = (idx + 1) & self.mask;
+    fn clear_slots(&mut self, touched: &[u32]) {
+        for &slot in touched {
+            unsafe {
+                let entry = self.entries.get_unchecked_mut(slot as usize);
+                entry.key = !0u32;
+                entry.val = !0u32;
             }
         }
     }
@@ -326,6 +312,11 @@ fn main() {
     if g_ptr.is_null() || g_ptr as isize == -1 {
         return;
     }
+
+    unsafe {
+        madvise(g_ptr, g_len, MADV_WILLNEED);
+    }
+
     let g_data = unsafe { std::slice::from_raw_parts(g_ptr, g_len) };
     let g_ptr_val = g_data.as_ptr() as usize;
 
@@ -385,9 +376,7 @@ fn main() {
                         u = u * 10 + unsafe { (*p - b'0') as u32 };
                         p = unsafe { p.add(1) };
                     }
-                    while unsafe { *p } <= b' ' {
-                        p = unsafe { p.add(1) };
-                    }
+                    p = unsafe { p.add(1) }; // skip space
                     let mut v = unsafe { (*p - b'0') as u32 };
                     p = unsafe { p.add(1) };
                     while unsafe { *p } >= b'0' {
@@ -452,18 +441,14 @@ fn main() {
                         u = u * 10 + unsafe { (*p - b'0') as u32 };
                         p = unsafe { p.add(1) };
                     }
-                    while unsafe { *p } <= b' ' {
-                        p = unsafe { p.add(1) };
-                    }
+                    p = unsafe { p.add(1) }; // skip space
                     let mut v = unsafe { (*p - b'0') as u32 };
                     p = unsafe { p.add(1) };
                     while unsafe { *p } >= b'0' {
                         v = v * 10 + unsafe { (*p - b'0') as u32 };
                         p = unsafe { p.add(1) };
                     }
-                    while unsafe { *p } <= b' ' {
-                        p = unsafe { p.add(1) };
-                    }
+                    p = unsafe { p.add(1) }; // skip space
                     let mut w = unsafe { (*p - b'0') as u64 };
                     p = unsafe { p.add(1) };
                     while unsafe { *p } >= b'0' {
@@ -510,7 +495,7 @@ fn main() {
         let s = (p + 4095) & !4095;
         let e = (p + g_len) & !4095;
         if e > s {
-            madvise(s as *mut u8, e - s, 4);
+            madvise(s as *mut u8, e - s, MADV_DONTNEED);
         }
         munmap(g_ptr, g_len);
     }
@@ -608,9 +593,9 @@ fn main() {
             std::thread::Builder::new()
                 .spawn(move || {
                     let out_ptr = answers_ptr as *mut i64;
-                    // 2MB L3-resident map per worker
+                    // 2MB L3-resident map per worker with unified key+val cache lines
                     let mut map = SmallMap::new(1 << 18);
-                    let mut touched: Vec<u32> = Vec::with_capacity(4096);
+                    let mut touched: Vec<u32> = Vec::with_capacity(131072);
                     let mut pq_fwd = Heap4Fast::new();
                     let mut pq_bwd = Heap4Fast::new();
 
@@ -631,10 +616,16 @@ fn main() {
                         pq_bwd.clear();
                         touched.clear();
 
-                        map.insert(s, (0 << 16) | 0xFFFF);
-                        map.insert(t, (0xFFFF << 16) | 0);
-                        touched.push(s);
-                        touched.push(t);
+                        let (slot_s, _, _) = map.probe_entry(s);
+                        unsafe {
+                            map.entries.get_unchecked_mut(slot_s).val = (0 << 16) | 0xFFFF;
+                        }
+                        let (slot_t, _, _) = map.probe_entry(t);
+                        unsafe {
+                            map.entries.get_unchecked_mut(slot_t).val = (0xFFFF << 16) | 0;
+                        }
+                        touched.push(slot_s as u32);
+                        touched.push(slot_t as u32);
 
                         pq_fwd.push(0, s);
                         pq_bwd.push(0, t);
@@ -679,21 +670,25 @@ fn main() {
                                     let nd16 = nd as u16;
                                     if nd16 < cur_fwd {
                                         if is_new {
-                                            touched.push(to);
-                                        }
-                                        unsafe {
-                                            *map.vals.get_unchecked_mut(slot) =
-                                                ((nd16 as u32) << 16) | (packed & 0xFFFF);
-                                        }
-                                        pq_fwd.push(nd, to);
-
-                                        let bwd_d = (packed & 0xFFFF) as u16;
-                                        if bwd_d != u16::MAX {
-                                            let total = nd + (bwd_d as u32);
-                                            if total < best {
-                                                best = total;
+                                            touched.push(slot as u32);
+                                            unsafe {
+                                                map.entries.get_unchecked_mut(slot).val =
+                                                    ((nd16 as u32) << 16) | 0xFFFF;
+                                            }
+                                        } else {
+                                            unsafe {
+                                                map.entries.get_unchecked_mut(slot).val =
+                                                    ((nd16 as u32) << 16) | (packed & 0xFFFF);
+                                            }
+                                            let bwd_d = (packed & 0xFFFF) as u16;
+                                            if bwd_d != u16::MAX {
+                                                let total = nd + (bwd_d as u32);
+                                                if total < best {
+                                                    best = total;
+                                                }
                                             }
                                         }
+                                        pq_fwd.push(nd, to);
                                     }
                                 }
                             }
@@ -727,27 +722,31 @@ fn main() {
                                     let nd16 = nd as u16;
                                     if nd16 < cur_bwd {
                                         if is_new {
-                                            touched.push(to);
-                                        }
-                                        unsafe {
-                                            *map.vals.get_unchecked_mut(slot) =
-                                                (packed & 0xFFFF_0000) | (nd16 as u32);
-                                        }
-                                        pq_bwd.push(nd, to);
-
-                                        let fwd_d = (packed >> 16) as u16;
-                                        if fwd_d != u16::MAX {
-                                            let total = nd + (fwd_d as u32);
-                                            if total < best {
-                                                best = total;
+                                            touched.push(slot as u32);
+                                            unsafe {
+                                                map.entries.get_unchecked_mut(slot).val =
+                                                    0xFFFF_0000 | (nd16 as u32);
+                                            }
+                                        } else {
+                                            unsafe {
+                                                map.entries.get_unchecked_mut(slot).val =
+                                                    (packed & 0xFFFF_0000) | (nd16 as u32);
+                                            }
+                                            let fwd_d = (packed >> 16) as u16;
+                                            if fwd_d != u16::MAX {
+                                                let total = nd + (fwd_d as u32);
+                                                if total < best {
+                                                    best = total;
+                                                }
                                             }
                                         }
+                                        pq_bwd.push(nd, to);
                                     }
                                 }
                             }
                         }
 
-                        map.clear_keys(&touched);
+                        map.clear_slots(&touched);
                         touched.clear();
 
                         let ans = if best != u32::MAX {

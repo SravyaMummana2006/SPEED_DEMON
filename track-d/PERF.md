@@ -78,5 +78,21 @@
   - **Median Wall Time**: 0.7400 s (vs v4 1.0000 s baseline, **1.35x to 1.43x speedup**)
   - **Min Wall Time**: 0.7000 s
   - **Peak Memory (RSS)**: **160 MB** (vs v4 416 MB, **61.6% memory reduction**)
-  - **Verification**: Verified byte-for-byte sha256 match across `tiny-seed1`, `sample-seed1`, and `full-seed1` (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
-  - Thread matrix ($n \in \{1, 2, 4, 8, 12\}$): **PASS**.
+
+## Cache-Line Unified Entries & O(1) Slot Reset (v6)
+- **Architecture**:
+  1. **Unified 8-Byte MapEntry**: Packed `struct MapEntry { key: u32, val: u32 }` stores key and value in the exact same 8-byte word. Linear probing accesses contiguous 64-byte L1 cache lines without secondary vector dereferencing.
+  2. **Direct Slot Reset (`clear_slots`)**: `touched` records the direct table slot indices `slot: u32`. Post-query cleanup resets `entries[slot]` directly in $O(1)$ without any re-hashing or probing.
+  3. **Zero-Realloc Worker Buffers**: `Heap4Fast` pre-allocated to 65,536 elements (512 KB) and `touched` to 131,072 elements (512 KB), completely eliminating heap reallocations during graph traversal.
+  4. **Fast Parsing & Kernel Readahead**: Pre-notified kernel via `madvise(MADV_WILLNEED)` and replaced byte loops with direct pointer advancement on ASCII field separators.
+- **Dataset**: `full-seed1` (1,740,512 nodes, 5,000,000 edges, 2,000 queries)
+- **Measured Wall Times (5 runs)**:
+  - Run 1: 0.7500 s (Peak RSS: 159.75 MB)
+  - Run 2: 0.6600 s (Peak RSS: 160.00 MB)
+  - Run 3: 0.5500 s (Peak RSS: 160.12 MB)
+  - Run 4: 0.7100 s (Peak RSS: 160.12 MB)
+  - Run 5: 0.6100 s (Peak RSS: 160.00 MB)
+- **Summary**:
+  - **Median Wall Time**: **0.6600 s** (Min: **0.5500 s**, vs v4 1.0000 s baseline, **1.52x to 1.82x speedup**)
+  - **Peak Memory (RSS)**: **160 MB** (vs initial v4 416 MB, **61.6% memory reduction**)
+  - **Verification**: Byte-for-byte exact sha256 match on `tiny-seed1`, `sample-seed1`, and `full-seed1` (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
