@@ -117,3 +117,21 @@
   - **Min Wall Time**: 0.07 s (70 ms)
   - **Peak Working Set**: 31.9 MB (reduced from 34.4 MB)
   - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1`.
+
+
+## Source Footprint Compression, Exact Pre-sizing & x86-64-v3 Architecture (v8)
+- **Architecture**:
+  1. **x86-64-v3 Hardware Optimization**: Added `.cargo/config.toml` targeting `x86-64-v3` architecture (AVX2, BMI1, BMI2, FMA, fast bit manipulation).
+  2. **Exact Pre-sizing in Parallel Reducer**: Pre-computed exact key counts per hour bucket to allocate `keys: Vec<u64>` with exact capacity, eliminating heap reallocations during Phase 2.
+  3. **Source Footprint Minimization**: Streamlined codebase to exactly 200 lines (down from 247 in v6 and 293 in v7), delivering a direct boost to the hackathon efficiency coefficient $K$ without sacrificing safety or readability. Zero `unsafe`.
+- **Dataset**: `full-seed1` (3,100,000 records, 238,836,234 bytes)
+- **Measured Wall Times (5 runs, Linux ext4 /tmp)**:
+  - Run 1: 0.10 s (Peak Working Set: 32.30 MB)
+  - Run 2: 0.09 s (Peak Working Set: 29.31 MB)
+  - Run 3: 0.08 s (Peak Working Set: 31.36 MB)
+  - Run 4: 0.08 s (Peak Working Set: 32.37 MB)
+  - Run 5: 0.10 s (Peak Working Set: 33.28 MB)
+- **Summary**:
+  - **Peak Working Set**: 29.31 MB minimum
+  - **Source Size**: 200 lines (19% source size reduction vs v6)
+  - **Correctness**: 100% exact byte match on `tiny-seed1`, `sample-seed1`, and `full-seed1`.
