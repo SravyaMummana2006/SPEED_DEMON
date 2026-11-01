@@ -2,10 +2,17 @@ use std::arch::x86_64::*;
 use std::fs::{create_dir_all, metadata, File};
 use std::io::{Read, Seek, SeekFrom::Start, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
 const D: [&[u8]; 4] = [b"2026-10-30", b"2026-10-31", b"2026-11-01", b"2026-11-02"];
+
+#[repr(C)]
+pub struct Slot {
+    pub hash: AtomicU64,
+    pub ptr: AtomicPtr<u8>,
+    pub len: AtomicU16,
+}
 
 #[inline(always)]
 fn push_val(b: &mut Vec<u8>, mut v: u32) {
@@ -34,24 +41,96 @@ unsafe fn hash_ep(b: &[u8], mut p: usize) -> (u64, usize, usize) {
 }
 
 #[inline(always)]
-fn get_slot(tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>, eh: u64, b: &[u8]) -> usize {
+fn get_slot(
+    tab: &[Slot],
+    ep: &Mutex<Vec<(usize, Box<[u8]>)>>,
+    eh: u64,
+    b: &[u8],
+) -> usize {
+    debug_assert!(eh != 0, "hash must be non-zero");
     let mut i = ((eh >> 20) as usize) & 4095;
-    loop {
+
+    // 1. Fast path: contiguous cache-line lookup
+    let mut probes = 0;
+    while probes < 4096 {
         let slot = unsafe { tab.get_unchecked(i) };
-        match slot.load(Relaxed) {
-            v if v == eh => return i,
-            0 => match slot.compare_exchange(0, eh, Relaxed, Relaxed) {
-                Ok(_) => { ep.lock().unwrap().push((i, b.to_vec())); return i; }
-                Err(v) if v == eh => return i,
-                _ => i = (i + 1) & 4095,
-            },
-            _ => i = (i + 1) & 4095,
+        let v = slot.hash.load(Acquire);
+        if v == eh {
+            let len = slot.len.load(Relaxed) as usize;
+            if len == b.len() {
+                let p = slot.ptr.load(Relaxed);
+                // SAFETY:
+                // 1. Pointer Validity: `p` comes from a valid Box<[u8]>. Non-null and points to `len` bytes.
+                // 2. Immutability: Endpoint bytes are never mutated after publication via `slot.hash.store(eh, Release)`.
+                // 3. Ownership & Lifetime: Allocation is owned by `ep` vector, which outlives all worker threads.
+                // 4. Thread Visibility: `slot.hash.load(Acquire)` synchronizes with `slot.hash.store(Release)`.
+                let slice = unsafe { std::slice::from_raw_parts(p, len) };
+                if slice == b {
+                    return i;
+                }
+            }
+            i = (i + 1) & 4095;
+            probes += 1;
+        } else if v == 0 {
+            break;
+        } else {
+            i = (i + 1) & 4095;
+            probes += 1;
         }
     }
+
+    if probes >= 4096 {
+        panic!("endpoint table full");
+    }
+
+    // 2. Slow path under lock
+    let mut guard = ep.lock().unwrap();
+    let mut i = ((eh >> 20) as usize) & 4095;
+    let mut probes = 0;
+    while probes < 4096 {
+        let slot = unsafe { tab.get_unchecked(i) };
+        let v = slot.hash.load(Relaxed);
+        if v == eh {
+            let len = slot.len.load(Relaxed) as usize;
+            if len == b.len() {
+                let p = slot.ptr.load(Relaxed);
+                // SAFETY:
+                // 1. Pointer Validity: `p` points to `len` bytes allocated via Box<[u8]> by a previous holder of `ep.lock()`.
+                // 2. Immutability: Endpoint bytes are never mutated after creation.
+                // 3. Ownership & Lifetime: Allocation is retained inside `ep`, which outlives all worker threads.
+                // 4. Synchronization: Mutual exclusion on `ep` guarantees all prior slot initializations are visible.
+                let slice = unsafe { std::slice::from_raw_parts(p, len) };
+                if slice == b {
+                    return i;
+                }
+            }
+            i = (i + 1) & 4095;
+            probes += 1;
+        } else if v == 0 {
+            let boxed: Box<[u8]> = b.to_vec().into_boxed_slice();
+            let p = boxed.as_ptr();
+            let len = boxed.len() as u16;
+
+            slot.ptr.store(p as *mut u8, Relaxed);
+            slot.len.store(len, Relaxed);
+            guard.push((i, boxed));
+            slot.hash.store(eh, Release);
+            return i;
+        } else {
+            i = (i + 1) & 4095;
+            probes += 1;
+        }
+    }
+
+    panic!("endpoint table full");
 }
 
 fn stream_chunk(
-    path: &PathBuf, s0: usize, s1: usize, tab: &[AtomicU64], ep: &Mutex<Vec<(usize, Vec<u8>)>>,
+    path: &PathBuf,
+    s0: usize,
+    s1: usize,
+    tab: &[Slot],
+    ep: &Mutex<Vec<(usize, Box<[u8]>)>>,
 ) -> ([Vec<u32>; 96], [Vec<u16>; 96]) {
     let mut bk: ([Vec<u32>; 96], [Vec<u16>; 96]) = (std::array::from_fn(|_| Vec::new()), std::array::from_fn(|_| Vec::new()));
     let (mut last_eh, mut last_slot) = (0u64, 0usize);
@@ -131,7 +210,12 @@ fn main() {
     }
     for i in 1..=n { starts[i] = starts[i].max(starts[i - 1]).min(len); }
 
-    let (tab, ep) = ((0..4096).map(|_| AtomicU64::new(0)).collect::<Vec<_>>(), Mutex::new(Vec::new()));
+    let tab: Vec<Slot> = (0..4096).map(|_| Slot {
+        hash: AtomicU64::new(0),
+        ptr: AtomicPtr::new(std::ptr::null_mut()),
+        len: AtomicU16::new(0),
+    }).collect();
+    let ep = Mutex::new(Vec::with_capacity(2048));
     let bk: Vec<([Vec<u32>; 96], [Vec<u16>; 96])> = std::thread::scope(|s| {
         let mut h = Vec::new();
         for t in 0..n {
@@ -144,7 +228,7 @@ fn main() {
     let mut ep_list = ep.into_inner().unwrap();
     ep_list.sort_unstable_by(|a, b| a.1.cmp(&b.1));
     let (mut rank, mut sorted) = ([0u16; 4096], Vec::with_capacity(ep_list.len()));
-    for (r, &(slot, ref b)) in ep_list.iter().enumerate() { rank[slot] = r as u16; sorted.push(b); }
+    for (r, &(slot, ref b)) in ep_list.iter().enumerate() { rank[slot] = r as u16; sorted.push(&b[..]); }
 
     let (slots, writer, next) = (
         (0..96).map(|_| Mutex::new(None)).collect::<Vec<_>>(),
